@@ -1,0 +1,11 @@
+[Unit]
+Description=bw1 sandbox: fetch finished workers and export them for the publisher
+After=docker.service bw1-egress.service
+
+[Service]
+Type=oneshot
+User=sandbox
+Group=sandbox
+UMask=0027
+Environment=SANDBOX_DIR=/opt/bw1-sandbox/bw1-ai-sandbox
+ExecStart=/opt/bw1-sandbox/venv/bin/python3 /opt/bw1-sandbox/droplet/sandbox_droplet.py export --out /var/lib/bw1-sandbox/export/workers.json

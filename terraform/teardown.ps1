@@ -1,6 +1,8 @@
-# Tear down everything this Terraform config created for the bw1-decomp harness: the droplet (with
-# its checkout, build, logs and keys), its firewall and its SSH key. It goes through
-# `terraform destroy` using the existing state. Branches and PRs already on GitHub are left alone.
+# Tear down everything this Terraform config created for the bw1-ai-sandbox droplet: the droplet (with
+# its sandbox, workers, clones, logs and both tokens), its firewall and its SSH key. It goes through
+# `terraform destroy` using the existing state. Branches and PRs already on GitHub are left alone, and
+# so is the DigitalOcean project "for bw1-decomp" (do_project_id): Terraform only assigned the droplet
+# to it and never manages the project itself, so destroy unassigns the droplet and leaves the project.
 #
 # Only the DigitalOcean token is needed. It is read from the same tokens file as deploy.ps1
 # ({"digitalocean": "..."}) into this process's environment only, and never printed or written.
@@ -68,8 +70,8 @@ try {
 
     if (-not $AutoApprove) {
         Write-Host ""
-        Write-Host "This permanently deletes the harness droplet (checkout, build, logs, keys), its firewall" -ForegroundColor Yellow
-        Write-Host "and its SSH key. Pushed branches and open PRs on GitHub are not touched." -ForegroundColor Yellow
+        Write-Host "This permanently deletes the sandbox droplet (workers, unpublished worker branches, logs, tokens), its firewall" -ForegroundColor Yellow
+        Write-Host "and its SSH key. Pushed branches, open PRs and the DigitalOcean project itself are not touched." -ForegroundColor Yellow
         $answer = Read-Host "Type 'destroy' to continue"
         if ($answer -ne "destroy") {
             Write-Host "Cancelled. Nothing was changed."
@@ -84,10 +86,11 @@ try {
     Write-Host "`n== Left in the state (should be empty) ==" -ForegroundColor Cyan
     & terraform state list
 
-    Write-Host "`n== DigitalOcean check (tag 'bw1-harness') ==" -ForegroundColor Cyan
+    Write-Host "`n== DigitalOcean check (tag 'bw1-sandbox') ==" -ForegroundColor Cyan
     $headers = @{ Authorization = "Bearer $doToken" }
-    $droplets = (Invoke-RestMethod -Headers $headers -Uri "https://api.digitalocean.com/v2/droplets?tag_name=bw1-harness").droplets
-    Write-Host ("Droplets tagged bw1-harness: {0}" -f @($droplets).Count)
+    $droplets = (Invoke-RestMethod -Headers $headers -Uri "https://api.digitalocean.com/v2/droplets?tag_name=bw1-sandbox").droplets
+    Write-Host ("Droplets tagged bw1-sandbox: {0}" -f @($droplets).Count)
+    Write-Host "The DigitalOcean project (do_project_id) was left in place; only the droplet was unassigned from it."
     Write-Host "`nTeardown finished." -ForegroundColor Green
 }
 finally {

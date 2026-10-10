@@ -1,0 +1,12 @@
+[Unit]
+Description=bw1 sandbox: lock worker containers' egress to the Anthropic API
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bw1-egress apply
+
+[Install]
+WantedBy=multi-user.target docker.service

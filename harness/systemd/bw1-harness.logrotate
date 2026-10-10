@@ -1,8 +1,0 @@
-/var/log/bw1-harness/harness.log {
-	weekly
-	rotate 12
-	compress
-	missingok
-	notifempty
-	copytruncate
-}

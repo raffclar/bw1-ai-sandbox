@@ -1,0 +1,34 @@
+# bw1-ai-sandbox settings for the droplet (installed next to sandbox.py as sandbox.droplet.toml and
+# selected with SANDBOX_CONFIG). Same as upstream sandbox.toml except where marked "droplet:".
+
+[vm]
+name = "bw1-sandbox"
+state_dir = "~/.local/share/bw1-sandbox"   # ssh key, known_hosts, Claude token (token.env), portal token
+# droplet: there is no VM, so cpus/memory_mb/disk are unused; the droplet's size is what counts.
+cpus = 8
+memory_mb = 16384
+disk = "20G"
+ghidra_port = 8080            # droplet: unused, Ghidra is off (no MCP config in local/)
+api_nets = ["160.79.104.0/23"]  # keep in step with API_NETS in /etc/bw1-sandbox/egress.conf
+
+[project]
+repo = "bw1-decomp"
+upstream = "origin/main"
+toolchain = ["build/tools", "build/compilers"]
+
+[project.data]
+source = "bw1-decomp/orig"
+mount = "/opt/orig"
+link = "orig"
+verify = true
+required = "@GAME_VERSION@/runblack-decrypted.exe"   # droplet: from Terraform (game_version)
+
+[worker]
+cpus = @WORKER_CPUS@          # droplet: from Terraform (worker_cpus)
+memory = "@WORKER_MEMORY@"    # droplet: from Terraform (worker_memory)
+preamble = "preamble.md"
+# droplet: --version from Terraform (game_version), as the sandbox README says for other versions
+setup = ["python3", "configure.py", "--version", "@GAME_VERSION@", "--dtk", "build/tools/dtk", "--objdiff", "build/tools/objdiff-cli",
+         "--wrapper", "build/tools/wibo", "--compilers", "build/compilers",
+         "--lld-link", "build/tools/llvm/bin/lld-link"]
+packages = ["ninja-build", "clang-format", "llvm", "python3-pefile", "python3-yaml"]

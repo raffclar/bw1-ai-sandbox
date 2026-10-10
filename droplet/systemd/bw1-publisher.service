@@ -1,0 +1,15 @@
+[Unit]
+Description=bw1 sandbox: publish finished workers as draft PRs on the fork
+Wants=bw1-sandbox-export.service
+After=bw1-sandbox-export.service network-online.target
+ConditionPathExists=!/etc/bw1-sandbox/STOP
+
+[Service]
+Type=oneshot
+User=publisher
+Group=publisher
+ExecStart=/usr/bin/python3 /opt/bw1-sandbox/droplet/publisher.py --config /etc/bw1-sandbox/publisher.env
+TimeoutStartSec=30min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

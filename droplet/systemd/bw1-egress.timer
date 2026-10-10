@@ -1,0 +1,9 @@
+[Unit]
+Description=bw1 sandbox: re-apply worker egress rules (refreshes api.anthropic.com addresses)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

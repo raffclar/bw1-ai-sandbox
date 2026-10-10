@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sandbox": {
+      "command": "/opt/bw1-sandbox/venv/bin/python3",
+      "args": ["/opt/bw1-sandbox/droplet/sandbox_droplet.py", "mcp"]
+    }
+  }
+}

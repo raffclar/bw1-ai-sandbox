@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# pre-push hook of the publisher's clone. Every push must CREATE a new branch under $BRANCH_PREFIX on
+# the fork: pushing to openblack, updating an existing branch (so any force push), deleting a branch,
+# pushing tags, touching main or carrying game files (orig/, LFS pointers) are all refused.
+set -euo pipefail
+
+remote_url="${2:-}"
+BRANCH_PREFIX=ai-sandbox/
+if [[ -r /etc/bw1-sandbox/publisher.env ]]; then
+	BRANCH_PREFIX="$(sed -n 's/^BRANCH_PREFIX=//p' /etc/bw1-sandbox/publisher.env | tr -d '"' | tail -n 1)"
+fi
+[[ "$BRANCH_PREFIX" == */ && "$BRANCH_PREFIX" != main* && "$BRANCH_PREFIX" != master* ]] ||
+	{ echo "pre-push: bad BRANCH_PREFIX" >&2; exit 1; }
+if [[ "${remote_url,,}" == *openblack/* ]]; then
+	echo "pre-push: refusing to push to $remote_url (never openblack)" >&2
+	exit 1
+fi
+
+# The game files never leave the droplet: refuse any change under orig/, to .gitattributes, or that
+# adds a Git LFS pointer.
+game_files_ok() {
+	local sha="$1" base f ok=0
+	base="$(git merge-base refs/remotes/origin/main "$sha" 2>/dev/null)" ||
+		{ echo "pre-push: no merge base with origin/main" >&2; return 1; }
+	while IFS= read -r f; do
+		case "$f" in
+		orig | orig/* | *.gitattributes) echo "pre-push: refusing game files: $f" >&2; ok=1; continue ;;
+		esac
+		if git cat-file -p "$sha:$f" 2>/dev/null | head -c 200 | grep -q '^version https://git-lfs'; then
+			echo "pre-push: refusing an LFS pointer: $f" >&2
+			ok=1
+		fi
+	done < <(git diff --name-only "$base" "$sha")
+	return "$ok"
+}
+
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+	: "$local_ref"
+	if [[ "$remote_ref" != "refs/heads/$BRANCH_PREFIX"* ]]; then
+		echo "pre-push: refusing $remote_ref (only refs/heads/$BRANCH_PREFIX*)" >&2
+		status=1
+	elif [[ "$local_sha" == "$zero" ]]; then
+		echo "pre-push: refusing to delete $remote_ref" >&2
+		status=1
+	elif [[ "$remote_sha" != "$zero" ]]; then
+		echo "pre-push: $remote_ref already exists; the publisher only creates new branches" >&2
+		status=1
+	elif ! game_files_ok "$local_sha"; then
+		status=1
+	fi
+done
+exit "$status"

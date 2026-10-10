@@ -1,0 +1,15 @@
+[Unit]
+Description=bw1 sandbox: resume workers stopped by the subscription usage limit once it resets
+After=docker.service bw1-egress.service
+Wants=bw1-egress.service
+
+[Service]
+User=sandbox
+Group=sandbox
+Environment=SANDBOX_DIR=/opt/bw1-sandbox/bw1-ai-sandbox
+ExecStart=/opt/bw1-sandbox/venv/bin/python3 /opt/bw1-sandbox/droplet/sandbox_droplet.py sandbox autoresume
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

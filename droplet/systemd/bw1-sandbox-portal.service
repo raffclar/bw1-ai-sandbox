@@ -1,0 +1,17 @@
+[Unit]
+Description=bw1 sandbox portal (localhost only; reach it through an SSH tunnel)
+After=docker.service bw1-egress.service
+Wants=bw1-egress.service
+
+[Service]
+User=sandbox
+Group=sandbox
+Environment=SANDBOX_DIR=/opt/bw1-sandbox/bw1-ai-sandbox
+# Never --pants-down-mode, never a non-loopback --host: the wrapper refuses both.
+# --no-autoresume: bw1-sandbox-autoresume.service does that.
+ExecStart=/opt/bw1-sandbox/venv/bin/python3 /opt/bw1-sandbox/droplet/sandbox_droplet.py portal --port 8765 --no-autoresume
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

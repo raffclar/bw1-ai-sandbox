@@ -1,0 +1,10 @@
+[Unit]
+Description=bw1 sandbox: publish finished workers periodically
+
+[Timer]
+OnActiveSec=15min
+OnUnitInactiveSec=@PUBLISH_INTERVAL@
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

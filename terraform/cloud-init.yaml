@@ -1,6 +1,6 @@
 #cloud-config
-# First boot only: base packages. Everything harness-specific is done by
-# harness/setup-droplet.sh, which Terraform runs over SSH once the keys are uploaded.
+# First boot only: base packages. Everything sandbox-specific is done by
+# droplet/setup-droplet.sh, which Terraform runs over SSH once the secrets are uploaded.
 package_update: true
 package_upgrade: true
 packages:

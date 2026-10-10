@@ -35,6 +35,8 @@ orig-*.tar.gz
 *.dll
 *.lib
 
-# Harness dry runs and Python caches
-harness/dry-run/
+# Deploy keys for the private bw1-build repo (scripts/new-bw1-build-key.ps1)
+keys/
+
+# Python caches
 __pycache__/
