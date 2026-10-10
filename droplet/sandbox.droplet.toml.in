@@ -13,7 +13,7 @@ api_nets = ["160.79.104.0/23"]  # keep in step with API_NETS in /etc/bw1-sandbox
 
 [project]
 repo = "bw1-decomp"
-upstream = "origin/main"
+upstream = "upstream/main"    # droplet: the host clone's openblack remote is `upstream` (fork = raffclar)
 toolchain = ["build/tools", "build/compilers"]
 
 [project.data]

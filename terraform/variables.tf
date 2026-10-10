@@ -99,6 +99,28 @@ variable "sandbox_ref" {
   }
 }
 
+variable "repo_source" {
+  description = "\"local\" (default): the sandbox's host bw1-decomp clone is your local clone (local_repo_path), uploaded as a git bundle of all refs and checked out at your HEAD. \"upstream\": a fresh clone of upstream_repo at bw1_decomp_ref."
+  type        = string
+  default     = "local"
+  validation {
+    condition     = contains(["local", "upstream"], var.repo_source)
+    error_message = "local or upstream."
+  }
+}
+
+variable "local_repo_path" {
+  description = "Your local bw1-decomp clone (repo_source = \"local\" and/or orig_source = \"local\"). deploy.ps1 packs it."
+  type        = string
+  default     = "E:/bw1-decomp/bw1-decomp"
+}
+
+variable "local_bundle_path" {
+  description = "Set by deploy.ps1, not by hand: the git bundle of local_repo_path for this run (a temporary file, with repo-head.txt next to it)."
+  type        = string
+  default     = ""
+}
+
 variable "upstream_repo" {
   description = "bw1-decomp repository the sandbox clone and the publisher fetch from (read-only)."
   type        = string
@@ -106,7 +128,7 @@ variable "upstream_repo" {
 }
 
 variable "bw1_decomp_ref" {
-  description = "Branch or commit checked out in the sandbox's bw1-decomp clone; `sync` sends it to workers as their base."
+  description = "repo_source = \"upstream\" only: branch or commit checked out in the sandbox's bw1-decomp clone (`sync` sends it to workers as their base). With repo_source = \"local\" your checked-out HEAD is used."
   type        = string
   default     = "main"
 }
@@ -156,13 +178,25 @@ variable "claude_code_version" {
 # --- original game files ----------------------------------------------------------------------
 
 variable "orig_source" {
-  description = "\"archive\" (default): upload orig_archive_path (your bw1-original.zip, or a .tar.gz from scripts/pack-orig.ps1) and unpack it on the droplet host. \"manual\": copy orig/ to the droplet yourself and re-run the setup."
+  description = "\"local\" (default): orig/ from the local clone (local_repo_path), packed by deploy.ps1 (game_version, or orig_upload_versions, plus libs/ and directx7.0/). \"archive\": upload orig_archive_path (bw1-original.zip or a pack-orig.ps1 .tar.gz). \"manual\": copy orig/ to the droplet yourself and re-run the setup."
   type        = string
-  default     = "archive"
+  default     = "local"
   validation {
-    condition     = contains(["archive", "manual"], var.orig_source)
-    error_message = "archive or manual."
+    condition     = contains(["local", "archive", "manual"], var.orig_source)
+    error_message = "local, archive or manual."
   }
+}
+
+variable "orig_upload_versions" {
+  description = "With orig_source = \"local\": the orig/<version> folders to upload. Empty: game_version only. libs/ and directx7.0/ always go too; other versions stay on your PC."
+  type        = list(string)
+  default     = []
+}
+
+variable "orig_upload_path" {
+  description = "Set by deploy.ps1, not by hand: the packed orig/ archive to upload this run (a temporary file). Empty: orig_archive_path."
+  type        = string
+  default     = ""
 }
 
 variable "game_version" {

@@ -12,14 +12,14 @@
 #          publisher= holds the GitHub token; pushes branches and opens PRs on the fork
 #
 # Environment (set by Terraform): SANDBOX_REPO SANDBOX_REF UPSTREAM_REPO BW1_DECOMP_REF FORK_REPO
-#   ORIG_SOURCE GAME_VERSION FEEDBACK_TO_SANDBOX WORKER_CPUS WORKER_MEMORY PUBLISH_INTERVAL PUBLISHER_ENABLED AUTORESUME_ENABLED
+#   REPO_SOURCE ORIG_SOURCE GAME_VERSION FEEDBACK_TO_SANDBOX WORKER_CPUS WORKER_MEMORY PUBLISH_INTERVAL PUBLISHER_ENABLED AUTORESUME_ENABLED
 #   PORTAL_ENABLED ORCHESTRATOR_TOOLS CLAUDE_VERSION
 set -Eeuo pipefail
 
 : "${SANDBOX_REPO:=https://github.com/bwrsandman/bw1-ai-sandbox.git}"
 : "${SANDBOX_REF:?pin the sandbox to a commit}"
 : "${UPSTREAM_REPO:=openblack/bw1-decomp}" "${BW1_DECOMP_REF:=main}" "${FORK_REPO:?}"
-: "${ORIG_SOURCE:=archive}" "${GAME_VERSION:=BW1W120}" "${FEEDBACK_TO_SANDBOX:=false}" "${WORKER_CPUS:=2}" "${WORKER_MEMORY:=4g}" "${PUBLISH_INTERVAL:=30min}"
+: "${REPO_SOURCE:=local}" "${ORIG_SOURCE:=local}" "${GAME_VERSION:=BW1W120}" "${FEEDBACK_TO_SANDBOX:=false}" "${WORKER_CPUS:=2}" "${WORKER_MEMORY:=4g}" "${PUBLISH_INTERVAL:=30min}"
 : "${PUBLISHER_ENABLED:=true}" "${AUTORESUME_ENABLED:=true}" "${PORTAL_ENABLED:=false}"
 : "${ORCHESTRATOR_TOOLS:=true}" "${CLAUDE_VERSION:=stable}"
 
@@ -119,21 +119,58 @@ say "python environment"
 if [[ "$ORCHESTRATOR_TOOLS" == true ]]; then "$VENV/bin/pip" install -q mcp; fi
 chmod 0755 "$DROPLET" "$DROPLET"/*.py "$DROPLET"/*.sh "$DROPLET/pre-push"
 
-say "bw1-decomp clone ($UPSTREAM_REPO @ $BW1_DECOMP_REF)"
+say "bw1-decomp clone ($REPO_SOURCE)"
+# The sandbox's host clone. Remotes: `upstream` = UPSTREAM_REPO (fetch; push DISABLED), `fork` = FORK_REPO
+# (fetch; push DISABLED here too: the publisher pushes from its own clone, with its own credential).
 install -d -o sandbox -g sandbox -m 0750 "$CLONE"
-if [[ ! -d "$CLONE/.git" ]]; then
-	as sandbox git clone -q "https://github.com/$UPSTREAM_REPO.git" "$CLONE"
+BUNDLE="$BASE/incoming/repo.bundle"
+HEADFILE="$BASE/incoming/repo-head.txt"
+if [[ "$REPO_SOURCE" == local ]]; then
+	if [[ -f "$BUNDLE" ]]; then
+		read -r HEAD_BRANCH HEAD_SHA <"$HEADFILE"
+		[[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+			{ echo "ERROR: bad repo-head.txt" >&2; exit 2; }
+		chmod 0644 "$BUNDLE"
+		as sandbox git bundle verify -q "$BUNDLE"
+		[[ -d "$CLONE/.git" ]] || as sandbox git init -q "$CLONE"
+		# Every branch and tag as-is, and the local clone's own remote-tracking refs under fork/.
+		as sandbox git -C "$CLONE" fetch -q --update-head-ok --force "$BUNDLE" \
+			'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*' 'refs/remotes/origin/*:refs/remotes/fork/*'
+		if [[ "$HEAD_BRANCH" == HEAD ]]; then
+			as sandbox git -C "$CLONE" checkout -q -f --detach "$HEAD_SHA"
+		else
+			as sandbox git -C "$CLONE" checkout -q -f "$HEAD_BRANCH"
+			as sandbox git -C "$CLONE" reset -q --hard "$HEAD_SHA"
+		fi
+		rm -f "$BUNDLE" "$HEADFILE"
+		echo "host clone at $HEAD_BRANCH @ ${HEAD_SHA:0:8} (from your local clone)"
+	elif [[ ! -d "$CLONE/.git" ]]; then
+		echo "ERROR: REPO_SOURCE=local but no uploaded bundle and no existing clone" >&2
+		exit 2
+	fi
+else
+	[[ -d "$CLONE/.git" ]] || as sandbox git clone -q --origin upstream "https://github.com/$UPSTREAM_REPO.git" "$CLONE"
 fi
-as sandbox git -C "$CLONE" fetch -q origin
-as sandbox git -C "$CLONE" checkout -q "$BW1_DECOMP_REF"
-as sandbox git -C "$CLONE" remote set-url --push origin DISABLED
+for r in upstream fork; do
+	url="https://github.com/$UPSTREAM_REPO.git"
+	[[ $r == fork ]] && url="https://github.com/$FORK_REPO.git"
+	as sandbox git -C "$CLONE" remote get-url "$r" >/dev/null 2>&1 || as sandbox git -C "$CLONE" remote add "$r" "$url"
+	as sandbox git -C "$CLONE" remote set-url "$r" "$url"
+	as sandbox git -C "$CLONE" remote set-url --push "$r" DISABLED
+done
+as sandbox git -C "$CLONE" remote remove origin 2>/dev/null || true
+as sandbox git -C "$CLONE" fetch -q upstream main
+if [[ "$REPO_SOURCE" == upstream ]]; then
+	as sandbox git -C "$CLONE" checkout -q "$BW1_DECOMP_REF"
+fi
 
 say "original game files ($ORIG_SOURCE, $GAME_VERSION)"
 # The game files stay on the host: in the sandbox's clone (sandbox user, 0750) and the read-only copy
 # `sync` makes for workers.
 case "$ORIG_SOURCE" in
-archive)
-	# bw1-original.zip (top folder bw1-original/) or a pack-orig.ps1 .tar.gz (top folder orig/). unpack-orig.py
+local | archive)
+	# local: deploy.ps1's orig-local.tar.gz from your clone (top folder orig/). archive: bw1-original.zip (top
+	# folder bw1-original/) or a pack-orig.ps1 .tar.gz (orig/). unpack-orig.py
 	# refuses any other top folder, path traversal and links; it unpacks into a fresh folder first.
 	ARCHIVE=""
 	for a in "$BASE/incoming/orig-archive.zip" "$BASE/incoming/orig-archive.tar.gz"; do

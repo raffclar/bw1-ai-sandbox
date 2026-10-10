@@ -11,11 +11,17 @@ fork_repo = "raffclar/bw1-decomp"
 # raffclar:<branch>; needs "github_openblack_pr" in the tokens file, see scripts/new-github-credentials.ps1).
 pr_target = "fork"
 
-# Original game files. Default: your zip (single top folder bw1-original/ or orig/), uploaded to the
-# droplet host, unpacked into bw1-decomp/orig/ there, verified, then deleted. A .tar.gz from
-# scripts/pack-orig.ps1 works too.
-orig_source       = "archive"
+# The project checkout: your local clone (git bundle of all refs, checked out at your HEAD on the
+# droplet), or "upstream" for a fresh clone of openblack/bw1-decomp at bw1_decomp_ref.
+repo_source     = "local"
+local_repo_path = "E:/bw1-decomp/bw1-decomp"
+
+# Game files: "local" = orig/ of that clone (game_version, or orig_upload_versions, plus libs/ and
+# directx7.0/ only). If it lacks them, deploy.ps1 falls back to orig_archive_path. Alternatives:
+# "archive" (your zip, or a pack-orig.ps1 .tar.gz) and "manual".
+orig_source       = "local"
 orig_archive_path = "E:/bw1-original.zip"
+# orig_upload_versions = ["BW1W120"]
 
 # do_project_id        = "0a017c67-5e46-4f17-9a26-d8f40de0ae7b"   # existing project "for bw1-decomp"
 # region               = "lon1"
@@ -25,7 +31,7 @@ orig_archive_path = "E:/bw1-original.zip"
 
 # bw1-ai-sandbox, pinned to the commit the droplet wrapper was written against.
 # sandbox_ref    = "3b6e2390ef9b898ee94ad6604efc1745b13e4179"
-# bw1_decomp_ref = "main"   # what `sync` gives workers as their base
+# bw1_decomp_ref = "main"   # repo_source = "upstream" only; with "local" your HEAD is the base
 # worker_cpus    = 2
 # worker_memory  = "4g"
 

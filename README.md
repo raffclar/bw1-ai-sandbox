@@ -12,7 +12,9 @@ It also follows the comments on them. Terraform builds the droplet and assigns i
 * a DigitalOcean token;
 * your Claude subscription token, from `claude setup-token`;
 * a GitHub token for the fork, plus a PR-only token for openblack if `pr_target = "openblack"`;
-* the game files: by default your zip, `E:/bw1-original.zip`, which must exist.
+* your local bw1-decomp clone, `E:/bw1-decomp/bw1-decomp` (gitignored here), with the game files in its `orig/`.
+  It becomes the droplet's project checkout and supplies the game files. The zip `E:/bw1-original.zip` is
+  the fallback for `orig/`.
 
 No worker starts by itself. You start them yourself with the orchestrator, the portal or the CLI.
 
@@ -43,7 +45,7 @@ virtualisation or bare metal, or your own Linux machine. On those, the unmodifie
 
 ```
 your PC                                  droplet (Ubuntu 24.04, project "for bw1-decomp")
-deploy.ps1 ── SSH ──────────────────►    root: provisioning, bw1-egress (iptables), unpacking the game files
+deploy.ps1 ── SSH ──────────────────►    root: provisioning, bw1-egress (iptables), unpacking your clone + orig/
   tokens file -> env only                decomp (uid 1000, docker, sudo)   = the sandbox VM's user, ssh from 127.0.0.1 only
                                          sandbox  runs sandbox.py / portal / autoresume / orchestrator; Claude token
                                          publisher                        GitHub tokens; pushes (fork only), draft PRs, comments
@@ -109,36 +111,57 @@ describes for other versions. `mcp.droplet.json` points the orchestrator at the 
 repo's `.mcp.json`. Python dependencies come from a venv (Ubuntu's `python3-libvirt` plus pip `docker>=7`, `paramiko`,
 `cryptography` and `mcp`). The libvirt bindings are only imported, never used.
 
-## Game files
+## Your clone and the game files
+
+### Project checkout (`repo_source`)
+
+* **`local` (default): your clone** at `local_repo_path` (`E:/bw1-decomp/bw1-decomp`).
+  * `deploy.ps1` shows its branch, HEAD and uncommitted changes. If there are any, it warns and asks you to type
+    `continue` (or pass `-AcceptUncommitted`), because only committed work is uploaded.
+  * `scripts/pack-local.ps1` packs it with `git bundle --all`, so every branch, tag and remote-tracking ref arrives
+    with full history. A bundle carries only git objects, so `build/`, `.ninja*`, `__pycache__`, `*.o`, objdiff
+    output and `orig/` never go in.
+  * On the droplet it becomes the sandbox's host clone, `/opt/bw1-sandbox/bw1-ai-sandbox/bw1-decomp`, checked out
+    at your branch and HEAD. The sandbox's `sync` sends that to workers as their base.
+  * Its remotes: `upstream` = openblack/bw1-decomp, fetch only, push URL `DISABLED`, and `sync` gives it to workers
+    as `origin/main`; `fork` = raffclar/bw1-decomp, fetch only here (the publisher pushes from its own clone).
+  * The uploaded bundle is deleted after the import. Each deploy imports your refs again and resets the host clone
+    to your new HEAD.
+* **`upstream`:** a fresh clone of openblack/bw1-decomp at `bw1_decomp_ref`.
+
+### Game files (`orig_source`)
 
 The copyrighted files are never committed here, and nothing downloads them. They go to the droplet **host** only.
 The sandbox's `sync` copies them to `/srv/decomp/shared/data`, which workers mount **read-only**, as upstream.
-Two sources (`orig_source`):
 
-* **`archive` (default): your zip.** `orig_archive_path` defaults to `E:/bw1-original.zip`.
+* **`local` (default): the `orig/` of your clone.** Only `orig/<game_version>` goes (or the `orig_upload_versions`
+  you list), plus `orig/libs` and `orig/directx7.0`; the other versions stay on your PC.
+  * It is packed into a temporary folder that `deploy.ps1` deletes when it ends, uploaded, unpacked on the host by
+    `unpack-orig.py` (the same checks as below), verified against `config/<version>/build.sha1`, and deleted there.
+  * If your clone lacks those folders, `deploy.ps1` falls back to the archive and says so.
+* **`archive`: your zip.** `orig_archive_path` defaults to `E:/bw1-original.zip`.
   * `deploy.ps1` checks that the file exists and prints its size, without opening it.
   * Terraform uploads it over SSH to `/opt/bw1-sandbox/incoming/`.
   * `droplet/unpack-orig.py` unpacks it on the host. Every member must sit under one top folder, `bw1-original/`
-    or `orig/`, which is stripped, so `bw1-original/BW1W120/…` becomes `bw1-decomp/orig/BW1W120/…`. Any other top
-    folder, more than one top folder, absolute paths, `..`, backslashes, drive letters, symlinks and hard links are
-    refused before anything is written.
-  * It then verifies `orig/BW1W120` against `config/BW1W120/build.sha1` (the exe and four DLLs) and stops if
-    they don't match.
-  * The uploaded archive is deleted after a successful unpack and check.
+    or `orig/`, which is stripped. Any other top folder, more than one top folder, absolute paths, `..`, backslashes,
+    drive letters, symlinks and hard links are refused before anything is written.
+  * It then verifies `orig/BW1W120` against `config/BW1W120/build.sha1` and stops if they don't match.
+  * The upload is deleted after a successful unpack and check.
 
   A `.tar.gz` from `scripts/pack-orig.ps1` works the same way.
 * **`manual`:** copy the files to `/opt/bw1-sandbox/bw1-ai-sandbox/bw1-decomp/orig/` and re-run the setup.
 
-**What your zip covers.** From the list of names in it:
+**What your clone and your zip cover** (from file names only):
 
-* It has `BW1W120/` (decrypted and encrypted exe, the four DLLs), `BW1WCI/`, `directx7.0/include/` and
-  `libs/msvc6.5/uuid.lib`. That is enough for the hash check, the dtk split, and per-object compiling and diffing,
-  which is how workers match functions (`ninja <object>`, `decomp-diff.py`).
-* It does **not** have the libraries a full `ninja` link with the final SHA-1 check needs: `libs/msvc6.5/libcmt.lib`,
-  `libcpmt.lib`, `msvcrtd.lib`, `libs/msvc6.4/libcmt.lib`, `libs/msvc6.0/libcimt.lib`, `libs/amaths-2.0/amaths.lib`
-  and `directx7.0/lib/`. bw1-decomp's Getting Started explains where each comes from.
-* The setup copies `libs/icc-5.0.115/libircmt.lib` out of the downloaded ICC compiler itself, as Getting Started
-  describes. It warns about the rest but does not fail.
+* Your clone's `orig/` has every version folder, plus `libs/` (msvc6.0, msvc6.4, msvc6.5 including `msvcrtd.lib`,
+  amaths-2.0, icc-5.0.115) and `directx7.0/include` + `lib`. That is everything a full `ninja` link with the final
+  hash check needs.
+* The zip, the fallback:
+
+  * It has `BW1W120/` (decrypted and encrypted exe, the four DLLs), `BW1WCI/`, `directx7.0/include/` and
+    `libs/msvc6.5/uuid.lib`. That is enough for the hash check, the dtk split and per-object matching.
+  * It lacks the CRT, AMaths and DirectX `lib/` files a full link needs. The setup copies `libircmt.lib` out of the
+    ICC compiler, and warns about the rest without failing.
 
 The game files never leave the droplet host and the workers' read-only mount. The publisher refuses any worker branch
 that touches `orig/` or `.gitattributes`, or that adds a Git LFS pointer. Its pre-push hook checks the same again.
@@ -272,7 +295,8 @@ anyone's comments.
      deploy.ps1 refuses it if it equals `github`, unless you pass `-AllowSameTokenForOpenblack`, and then it warns.
 2. **Fork.** `raffclar/bw1-decomp` must exist. Keep its `main` in step with upstream yourself; the publisher never
    touches `main`.
-3. **Game files.** By default `E:/bw1-original.zip` must exist; nothing else is needed.
+3. **Your clone and game files.** `E:/bw1-decomp/bw1-decomp` with `orig/` filled in as Getting Started describes
+   (or set `repo_source`/`orig_source` otherwise). Commit what workers should start from.
 4. **`terraform/terraform.tfvars`.** Copy it from `terraform.tfvars.example`. Your current `terraform.tfvars` still
    has settings of the old harness (`pr_draft`, `git_author_*` …). Terraform only warns about them, but remove them.
 5. **Run:**
@@ -281,10 +305,14 @@ anyone's comments.
    powershell -ExecutionPolicy Bypass -File E:\bw1-decomp\terraform\deploy.ps1           # -PlanOnly to stop before apply
    ```
 
-   The script checks the secrets, and the openblack PR token when `pr_target = "openblack"`. It checks that the zip
-   exists and prints its size, refuses secrets in tfvars, and checks the Terraform version. It then runs `init` and
-   `plan -out`, and prints a summary: resources, the DO project, droplet, sandbox commit, game files, workers, both
-   remotes and their roles, publisher and services. It applies only after you type `deploy`.
+   The script:
+   * checks the secrets, and the openblack PR token when `pr_target = "openblack"`;
+   * shows your clone's branch, HEAD and uncommitted changes, asking before it goes on without them;
+   * packs the bundle and the `orig/` subset into a temporary folder, or falls back to the zip;
+   * refuses secrets in tfvars and checks the Terraform version;
+   * runs `init` and `plan -out`, and prints a summary: resources, the DO project, droplet, sandbox commit, checkout,
+     game files, workers, both remotes and their roles, publisher and services;
+   * applies only after you type `deploy`, and deletes the temporary folder whatever happens.
 
    The secrets reach Terraform only as `DIGITALOCEAN_TOKEN`, `TF_VAR_claude_oauth_token`, `TF_VAR_github_token` and
    `TF_VAR_openblack_pr_token`. The saved plan holds them, so the script deletes it on exit. The state holds only a
@@ -363,14 +391,13 @@ Billing is hourly: destroy the droplet when idle.
 
 ## Open questions for you
 
-1. **bw1-decomp commit for workers.** The sandbox's `preamble.md` and orchestrator skill use `tools/idioms.py`,
-   `tools/decomp-similar.py`, `tools/decomp-queue.py` and a `decomp-matching` skill. None of them is on
-   `openblack/bw1-decomp` main (`c293511d`, 2026-10-08). Which branch has them? Set `bw1_decomp_ref` to it, or
-   workers will be told to use tools that aren't there.
-2. **Libraries missing from your zip.** It has no CRT, AMaths or DirectX `lib/` files, so workers can compile and
-   diff single objects but can't run a full `ninja` link with the final hash check. Should those files go into the
-   zip? Is it OK for the game files to sit on a droplet at all? They stay on the host and in the workers' read-only
-   mount.
+1. **Tools the sandbox expects.** The sandbox's `preamble.md` and orchestrator skill use `tools/idioms.py`,
+   `tools/decomp-similar.py`, `tools/decomp-queue.py` and a `decomp-matching` skill. None of them is on openblack
+   main (`c293511d`). Your local clone doesn't have them either (`main` @ `ece44f6b`). Which branch has them? Merge
+   it into your clone, or workers will be told to use tools that aren't there.
+2. **Game files on a droplet.** Your clone's `orig/` is complete, which settles the missing-libraries question
+   (the zip only matters as a fallback). Is it OK for `orig/<game_version>`, `libs` and `directx7.0` to sit on a
+   droplet? They stay on the host and in the workers' read-only mount, and other versions are not uploaded.
 3. **Threat model.** Do you accept containers on a shared kernel next to the publisher and its GitHub token,
    compared with the sandbox's VM?
 4. **PR target.** Draft PRs go to the fork until you set `pr_target = "openblack"`. Do openblack's maintainers want

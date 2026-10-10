@@ -26,6 +26,7 @@
 #   ... -ClaudeOAuthToken $o -GithubToken $t    # override "claude_oauth" / "github"
 #   ... -OpenblackPrToken $p                    # override "github_openblack_pr"
 #   ... -AllowSameTokenForOpenblack             # accept "github" as the openblack PR credential too (not recommended)
+#   ... -AcceptUncommitted                      # don't ask when the local clone has uncommitted changes
 #   ... -PlanOnly                               # every check, init and plan; stop before apply
 #
 # It refuses to go on unless the DigitalOcean token, the Claude subscription token and the GitHub token
@@ -39,6 +40,8 @@ param(
     [string]$GithubToken = "",
     [string]$OpenblackPrToken = "",
     [switch]$AllowSameTokenForOpenblack,
+    # Deploy even though the local clone has uncommitted changes (they are not uploaded).
+    [switch]$AcceptUncommitted,
     [string]$VarFile = "terraform.tfvars",
     [switch]$PlanOnly
 )
@@ -115,10 +118,38 @@ if (-not [string]::IsNullOrWhiteSpace($OpenblackPrToken) -and $OpenblackPrToken 
 Write-Host "Claude auth: subscription token (claude_oauth -> the sandbox's token.env, CLAUDE_CODE_OAUTH_TOKEN)"
 
 # --- game files ---------------------------------------------------------------------------------
-$origSource = Get-TfvarsString $varPath "orig_source" "archive"
+$repoSource = Get-TfvarsString $varPath "repo_source" "local"
+$origSource = Get-TfvarsString $varPath "orig_source" "local"
+$gameVersion = Get-TfvarsString $varPath "game_version" "BW1W120"
+$localRepo = Get-TfvarsString $varPath "local_repo_path" "E:/bw1-decomp/bw1-decomp"
+if (-not [IO.Path]::IsPathRooted($localRepo)) { $localRepo = Join-Path $terraformDir $localRepo }
+$uploadVersions = @($gameVersion)
+$m = Select-String -LiteralPath $varPath -Pattern '^\s*orig_upload_versions\s*=\s*\[([^\]]*)\]' | Select-Object -Last 1
+if ($m) {
+    $listed = @([regex]::Matches($m.Matches[0].Groups[1].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+    if ($listed.Count -gt 0) { $uploadVersions = $listed }
+}
+if ($repoSource -notin @("local", "upstream")) { Fail "repo_source must be ""local"" or ""upstream"", not ""$repoSource""" }
+if ($origSource -notin @("local", "archive", "manual")) { Fail "orig_source must be ""local"", ""archive"" or ""manual"", not ""$origSource""" }
+
+$archivePath = Get-TfvarsString $varPath "orig_archive_path" "E:/bw1-original.zip"
+if (-not [IO.Path]::IsPathRooted($archivePath)) { $archivePath = Join-Path $terraformDir $archivePath }
+$origOverride = ""
+if ($origSource -eq "local") {
+    # The local orig/ wins when it's present; otherwise fall back to the archive.
+    $missingOrig = @($uploadVersions | Where-Object { -not (Test-Path -LiteralPath (Join-Path $localRepo "orig\$_\runblack-decrypted.exe")) })
+    if (-not (Test-Path -LiteralPath (Join-Path $localRepo "orig\libs"))) { $missingOrig += "libs" }
+    if ($missingOrig.Count -gt 0) {
+        if (Test-Path -LiteralPath $archivePath -PathType Leaf) {
+            Write-Host "Game files: $localRepo\orig lacks $($missingOrig -join ', '); using the archive $archivePath instead" -ForegroundColor Yellow
+            $origSource = "archive"
+            $origOverride = "archive"
+        }
+        else { Fail "Refusing to deploy: $localRepo\orig lacks $($missingOrig -join ', ') and there is no archive at $archivePath." }
+    }
+    else { Write-Host "Game files: $localRepo\orig ($($uploadVersions -join ', ') + libs + directx7.0), packed for upload" }
+}
 if ($origSource -eq "archive") {
-    $archivePath = Get-TfvarsString $varPath "orig_archive_path" "E:/bw1-original.zip"
-    if (-not [IO.Path]::IsPathRooted($archivePath)) { $archivePath = Join-Path $terraformDir $archivePath }
     if ($archivePath -notmatch '(?i)\.(zip|tar\.gz|tgz)$') { Fail "orig_archive_path must be a .zip or .tar.gz: $archivePath" }
     if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
         Fail "Refusing to deploy: the game-files archive $archivePath does not exist (orig_source = ""archive"")."
@@ -130,8 +161,29 @@ if ($origSource -eq "archive") {
 elseif ($origSource -eq "manual") {
     Write-Host "Game files: manual (copy orig/ to the droplet yourself, then re-run the setup)"
 }
+
+# --- the local clone: show what will be uploaded --------------------------------------------------
+if ($repoSource -eq "local" -or $origSource -eq "local") {
+    if (-not (Test-Path -LiteralPath (Join-Path $localRepo ".git"))) { Fail "local_repo_path $localRepo is not a git clone" }
+}
+if ($repoSource -eq "local") {
+    $saved = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    $branch = (& git -C $localRepo rev-parse --abbrev-ref HEAD 2>$null)
+    $head = (& git -C $localRepo log -1 --format="%h %s" 2>$null)
+    $dirty = @(& git -C $localRepo status --porcelain 2>$null)
+    $ErrorActionPreference = $saved
+    Write-Host "Project checkout: $localRepo on $branch @ $head; uploaded as a git bundle of all refs (committed work only)"
+    if ($dirty.Count -gt 0) {
+        Write-Host "WARNING: $($dirty.Count) uncommitted change(s) in $localRepo will NOT be uploaded (workers start from the committed HEAD):" -ForegroundColor Yellow
+        $dirty | Select-Object -First 10 | ForEach-Object { Write-Host "    $_" }
+        if (-not $AcceptUncommitted) {
+            $answer = Read-Host "Type 'continue' to deploy without them (or commit first)"
+            if ($answer -ne "continue") { Write-Host "Cancelled. Nothing was changed."; exit 0 }
+        }
+    }
+}
 else {
-    Fail "orig_source must be ""archive"" or ""manual"", not ""$origSource"""
+    Write-Host "Project checkout: fresh clone of $upstreamRepo on the droplet"
 }
 
 # --- terraform ------------------------------------------------------------------------------
@@ -146,7 +198,24 @@ if (Test-Path $stateFile) {
 }
 
 Push-Location $terraformDir
+# Packed uploads (git bundle, orig/ subset) live only in this temporary folder, deleted in `finally`.
+$packDir = Join-Path ([IO.Path]::GetTempPath()) ("bw1-sandbox-upload-" + [guid]::NewGuid().ToString("N"))
 try {
+    if ($repoSource -eq "local" -or $origSource -eq "local") {
+        Write-Host "== packing the local clone ==" -ForegroundColor Cyan
+        $packArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path (Split-Path $terraformDir -Parent) "scripts\pack-local.ps1"),
+            "-OutDir", $packDir, "-RepoPath", $localRepo, "-Versions", ($uploadVersions -join ","))
+        if ($repoSource -ne "local") { $packArgs += "-SkipRepo" }
+        if ($origSource -ne "local") { $packArgs += "-SkipOrig" }
+        & powershell @packArgs
+        if ($LASTEXITCODE -ne 0) { Fail "packing $localRepo failed" }
+    }
+    # Non-secret run-time settings go on the command line, so they win over terraform.tfvars.
+    $runVars = @()
+    if ($repoSource -eq "local") { $runVars += "-var=local_bundle_path=" + ((Join-Path $packDir "repo.bundle") -replace '\\', '/') }
+    if ($origSource -eq "local") { $runVars += "-var=orig_upload_path=" + ((Join-Path $packDir "orig-local.tar.gz") -replace '\\', '/') }
+    if ($origOverride) { $runVars += "-var=orig_source=$origOverride" }
+
     $env:DIGITALOCEAN_TOKEN = $doToken
     $env:TF_VAR_claude_oauth_token = $ClaudeOAuthToken
     $env:TF_VAR_github_token = $GithubToken
@@ -157,7 +226,7 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail "terraform init failed" }
 
     Write-Host "`n== terraform plan ==" -ForegroundColor Cyan
-    & terraform plan -input=false -var-file="$varPath" -out="$planFile"
+    & terraform plan -input=false -var-file="$varPath" @runVars -out="$planFile"
     if ($LASTEXITCODE -ne 0) { Fail "terraform plan failed (nothing was changed)" }
 
     # Summary from the saved plan: only resource addresses, actions and non-secret settings are printed.
@@ -175,8 +244,11 @@ try {
     Write-Host ("  droplet      {0} in {1}" -f $vars.droplet_size.value, $vars.region.value)
     Write-Host ("  DO project   {0} (existing; the droplet is assigned to it, the project is never created or deleted)" -f $vars.do_project_id.value)
     Write-Host ("  sandbox      {0} @ {1}" -f $vars.sandbox_repo.value, $vars.sandbox_ref.value)
-    Write-Host ("  game files   {0} ({1})" -f $vars.orig_source.value, $vars.game_version.value)
-    Write-Host ("  workers      {0} CPUs, {1} each; base {2} @ {3}" -f $vars.worker_cpus.value, $vars.worker_memory.value, $vars.upstream_repo.value, $vars.bw1_decomp_ref.value)
+    $checkout = if ($vars.repo_source.value -eq "local") { "your clone $localRepo at $branch @ $head (git bundle, all refs)" } else { "fresh clone of $($vars.upstream_repo.value) @ $($vars.bw1_decomp_ref.value)" }
+    Write-Host ("  checkout     {0}" -f $checkout)
+    $gameFiles = if ($vars.orig_source.value -eq "local") { ($uploadVersions -join ", ") + " + libs + directx7.0 from your clone" } else { $vars.game_version.value }
+    Write-Host ("  game files   {0} ({1})" -f $vars.orig_source.value, $gameFiles)
+    Write-Host ("  workers      {0} CPUs, {1} each; base = the checkout's HEAD (sync)" -f $vars.worker_cpus.value, $vars.worker_memory.value)
     Write-Host "  remotes"
     Write-Host ("    {0,-24} push {1}* branches (create only), PRs + comments when it is the PR target   ['github']" -f $vars.fork_repo.value, $vars.branch_prefix.value)
     Write-Host ("    {0,-24} fetch only; {1}   ['github_openblack_pr']" -f $vars.upstream_repo.value, $(if ($vars.pr_target.value -eq "openblack") { "draft PRs from $($vars.fork_repo.value) branches + comments on them, never a push" } else { "no PRs (pr_target = fork)" }))
@@ -217,6 +289,8 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $planFile -ErrorAction SilentlyContinue
+    # The packed clone and game files never stay on this PC.
+    if (Test-Path -LiteralPath $packDir) { Remove-Item -LiteralPath $packDir -Recurse -Force -ErrorAction SilentlyContinue }
     Pop-Location
     Remove-Item Env:DIGITALOCEAN_TOKEN -ErrorAction SilentlyContinue
     Remove-Item Env:TF_VAR_claude_oauth_token -ErrorAction SilentlyContinue

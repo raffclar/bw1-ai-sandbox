@@ -65,7 +65,8 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail "terraform init failed" }
 
     Write-Host "`n== Destroy plan ==" -ForegroundColor Cyan
-    & terraform plan -destroy -input=false @varArgs -out="$planFile"
+    # Destroying needs none of deploy.ps1's temporary uploads (git bundle, packed orig/): say so explicitly.
+    & terraform plan -destroy -input=false @varArgs "-var=repo_source=upstream" "-var=orig_source=manual" -out="$planFile"
     if ($LASTEXITCODE -ne 0) { Fail "terraform plan -destroy failed" }
 
     if (-not $AutoApprove) {

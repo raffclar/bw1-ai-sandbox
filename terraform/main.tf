@@ -10,8 +10,11 @@ locals {
   pr_repo  = var.pr_target == "openblack" ? var.upstream_repo : var.fork_repo
 
 
-  # Uploaded archive keeps its type so the droplet knows how to unpack it.
-  orig_archive_remote = "/opt/bw1-sandbox/incoming/orig-archive.${can(regex("(?i)\\.zip$", var.orig_archive_path)) ? "zip" : "tar.gz"}"
+  # The game files uploaded this run: deploy.ps1's packed orig/ (orig_source = "local"), or the archive.
+  orig_file           = var.orig_upload_path != "" ? var.orig_upload_path : var.orig_archive_path
+  orig_uploaded       = contains(["local", "archive"], var.orig_source)
+  orig_archive_remote = "/opt/bw1-sandbox/incoming/orig-archive.${can(regex("(?i)\\.zip$", local.orig_file)) ? "zip" : "tar.gz"}"
+  repo_head_path      = var.local_bundle_path != "" ? "${dirname(var.local_bundle_path)}/repo-head.txt" : ""
 
   publisher_env = join("\n", [
     "UPSTREAM_REPO=${var.upstream_repo}",
@@ -41,6 +44,7 @@ locals {
     "BW1_DECOMP_REF=${var.bw1_decomp_ref}",
     "FORK_REPO=${var.fork_repo}",
     "ORIG_SOURCE=${var.orig_source}",
+    "REPO_SOURCE=${var.repo_source}",
     "GAME_VERSION=${var.game_version}",
     "WORKER_CPUS=${var.worker_cpus}",
     "WORKER_MEMORY=${var.worker_memory}",
@@ -83,8 +87,12 @@ resource "digitalocean_droplet" "sandbox" {
       error_message = "pr_target = \"openblack\" needs the PR-only credential for openblack (TF_VAR_openblack_pr_token, tokens file key \"github_openblack_pr\")."
     }
     precondition {
-      condition     = var.orig_source != "archive" || (var.orig_archive_path != "" && fileexists(var.orig_archive_path))
-      error_message = "orig_source = \"archive\" needs orig_archive_path pointing at an existing .zip or .tar.gz (default E:/bw1-original.zip)."
+      condition     = !local.orig_uploaded || (local.orig_file != "" && fileexists(local.orig_file))
+      error_message = "orig_source = \"local\" or \"archive\" needs the game-files archive: run deploy.ps1 (it packs orig/ from local_repo_path), or point orig_archive_path at an existing .zip or .tar.gz."
+    }
+    precondition {
+      condition     = var.repo_source != "local" || (var.local_bundle_path != "" && fileexists(var.local_bundle_path) && fileexists(local.repo_head_path))
+      error_message = "repo_source = \"local\" needs the git bundle of local_repo_path: run deploy.ps1, which packs it (scripts/pack-local.ps1)."
     }
   }
 }
@@ -142,11 +150,11 @@ data "archive_file" "droplet" {
 }
 
 resource "terraform_data" "orig_upload" {
-  count = var.orig_source == "archive" ? 1 : 0
+  count = local.orig_uploaded ? 1 : 0
 
   triggers_replace = [
     digitalocean_droplet.sandbox.id,
-    fileexists(var.orig_archive_path) ? filesha256(var.orig_archive_path) : "missing",
+    fileexists(local.orig_file) ? filesha256(local.orig_file) : "missing",
   ]
 
   connection {
@@ -162,8 +170,42 @@ resource "terraform_data" "orig_upload" {
   }
 
   provisioner "file" {
-    source      = var.orig_archive_path
+    source      = local.orig_file
     destination = local.orig_archive_remote
+  }
+}
+
+# Your local clone as a git bundle (all refs, your HEAD in repo-head.txt). setup-droplet.sh turns it into
+# the sandbox's host bw1-decomp clone and deletes the upload.
+resource "terraform_data" "repo_upload" {
+  count = var.repo_source == "local" ? 1 : 0
+
+  triggers_replace = [
+    digitalocean_droplet.sandbox.id,
+    fileexists(var.local_bundle_path) ? filesha256(var.local_bundle_path) : "missing",
+    local.repo_head_path != "" && fileexists(local.repo_head_path) ? filesha256(local.repo_head_path) : "missing",
+  ]
+
+  connection {
+    type        = "ssh"
+    host        = digitalocean_droplet.sandbox.ipv4_address
+    user        = "root"
+    private_key = file(pathexpand(var.ssh_private_key_path))
+    timeout     = "10m"
+  }
+
+  provisioner "remote-exec" {
+    inline = ["cloud-init status --wait > /dev/null || true", "install -d -m 0755 /opt/bw1-sandbox/incoming"]
+  }
+
+  provisioner "file" {
+    source      = var.local_bundle_path
+    destination = "/opt/bw1-sandbox/incoming/repo.bundle"
+  }
+
+  provisioner "file" {
+    source      = local.repo_head_path
+    destination = "/opt/bw1-sandbox/incoming/repo-head.txt"
   }
 }
 
@@ -178,6 +220,7 @@ resource "terraform_data" "provision" {
     sha256(local.setup_env),
     sha256("${var.claude_oauth_token}\n${var.github_token}\n${var.openblack_pr_token}"),
     length(terraform_data.orig_upload) > 0 ? terraform_data.orig_upload[0].id : "no-archive",
+    length(terraform_data.repo_upload) > 0 ? terraform_data.repo_upload[0].id : "no-bundle",
   ]
 
   lifecycle {
@@ -250,7 +293,7 @@ resource "terraform_data" "provision" {
     ]
   }
 
-  depends_on = [digitalocean_firewall.sandbox, terraform_data.orig_upload]
+  depends_on = [digitalocean_firewall.sandbox, terraform_data.orig_upload, terraform_data.repo_upload]
 }
 
 # --- DigitalOcean project --------------------------------------------------------------------

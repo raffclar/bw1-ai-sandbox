@@ -40,3 +40,9 @@ keys/
 
 # Python caches
 __pycache__/
+
+# The local bw1-decomp clone uploaded to the droplet (its own git repo, with orig/ game files)
+/bw1-decomp/
+
+# Backups of terraform.tfvars
+*.tfvars.bak*
