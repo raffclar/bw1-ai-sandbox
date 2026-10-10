@@ -27,8 +27,61 @@ required = "@GAME_VERSION@/runblack-decrypted.exe"   # droplet: from Terraform (
 cpus = @WORKER_CPUS@          # droplet: from Terraform (worker_cpus)
 memory = "@WORKER_MEMORY@"    # droplet: from Terraform (worker_memory)
 preamble = "preamble.md"
-# droplet: --version from Terraform (game_version), as the sandbox README says for other versions
-setup = ["python3", "configure.py", "--version", "@GAME_VERSION@", "--dtk", "build/tools/dtk", "--objdiff", "build/tools/objdiff-cli",
-         "--wrapper", "build/tools/wibo", "--compilers", "build/compilers",
-         "--lld-link", "build/tools/llvm/bin/lld-link"]
+# droplet: --version from Terraform (game_version), as the sandbox README says for other versions.
+# droplet: after configuring, mark the shared toolchain as built. It is a read-only copy of the host's, and a fresh
+# checkout makes the scripts that built it (download_tool.py, patch_compiler_headers.py) newer than it, so ninja would
+# try to download and patch it again: that fails with no network and a read-only compiler folder, and workers then
+# stub the scripts out. So: the scripts are dated back (content unchanged, so git sees no change), the header-patch
+# stamp is written only after checking that the shared headers are already patched, and every toolchain step gets
+# its .ninja_log record (ninja reruns any step it has no record of; the hash is ninja's own command hash).
+setup = ["python3", "-c", '''
+import os, pathlib, re, shutil, subprocess, sys, tempfile
+
+def ninja_hash(command):  # MurmurHash64A with ninja's seed, as ninja's build log stores it
+    m, mask = 0xC6A4A7935BD1E995, (1 << 64) - 1
+    data = command.encode()
+    h = (0xDECAFBADDECAFBAD ^ (len(data) * m)) & mask
+    full = len(data) // 8 * 8
+    for i in range(0, full, 8):
+        k = int.from_bytes(data[i:i + 8], "little") * m & mask
+        k = (k ^ (k >> 47)) * m & mask
+        h = (h ^ k) * m & mask
+    if data[full:]:
+        h = (h ^ int.from_bytes(data[full:], "little")) * m & mask
+    h = (h ^ (h >> 47)) * m & mask
+    return h ^ (h >> 47)
+
+cmd = ["python3", "configure.py", "--version", "@GAME_VERSION@", "--dtk", "build/tools/dtk",
+       "--objdiff", "build/tools/objdiff-cli", "--wrapper", "build/tools/wibo", "--compilers", "build/compilers",
+       "--lld-link", "build/tools/llvm/bin/lld-link"]
+if subprocess.run(cmd).returncode != 0:
+    sys.exit(1)
+for script in ("tools/download_tool.py", "tools/patch_compiler_headers.py"):
+    if os.path.exists(script):
+        os.utime(script, (0, 0))
+ninja = re.sub(r"[$]\n\s*", " ", pathlib.Path("build.ninja").read_text())  # join continued lines
+m = re.search(r"^build (\S+): patch_headers\s+(\S+)", ninja, re.M)
+if m:
+    stamp, include = pathlib.Path(m.group(1)), pathlib.Path(m.group(2), "include")
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = pathlib.Path(tmp, "include")
+        shutil.copytree(include, copy, copy_function=shutil.copyfile)  # writable copies of the read-only files
+        patched = subprocess.run([sys.executable, "tools/patch_compiler_headers.py", str(copy)]).returncode == 0
+        # compared as the patch script reads them (it rewrites every file it patches with \n line ends)
+        read = lambda f: f.read_text(encoding="utf-8", errors="replace")
+        patched = patched and all(read(f) == read(include / f.relative_to(copy)) for f in copy.rglob("*") if f.is_file())
+    if not patched:
+        sys.exit(f"setup: the shared compiler headers in {include} are not patched (run ninja on the host once)")
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+log = pathlib.Path(".ninja_log")
+lines = [] if log.exists() else ["# ninja log v5"]
+for out in re.findall(r"^build (\S+): (?:download_tool|patch_headers)\s", ninja, re.M):
+    if os.path.exists(out):
+        command = subprocess.run(["ninja", "-t", "commands", "-s", out], capture_output=True, text=True,
+                                 check=True).stdout.strip()
+        lines.append(f"0\t0\t{os.stat(out).st_mtime_ns}\t{out}\t{ninja_hash(command):x}")
+with open(log, "a") as f:
+    f.write("".join(line + "\n" for line in lines))
+''']
 packages = ["ninja-build", "clang-format", "llvm", "python3-pefile", "python3-yaml"]

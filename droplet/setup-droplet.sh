@@ -219,6 +219,11 @@ as sandbox bash -c "cd '$CLONE' && python3 configure.py --version $GAME_VERSION 
 for t in build/tools/objdiff-cli build/tools/wibo build/tools/llvm build/compilers/ICC/5.0.1; do
 	as sandbox bash -c "cd '$CLONE' && ninja '$t'" || echo "WARNING: ninja $t failed; workers may need it"
 done
+# The compiler-header patch writes into build/compilers, which workers get read-only: patch it here, before `sync`
+# copies the toolchain out (the worker setup in sandbox.droplet.toml checks it and marks the step done).
+if as sandbox bash -c "cd '$CLONE' && ninja -t query pre-compile" >/dev/null 2>&1; then
+	as sandbox bash -c "cd '$CLONE' && ninja pre-compile"
+fi
 
 # bw1-decomp's Getting Started: libircmt.lib can be copied out of the downloaded ICC compiler.
 ICC_LIB="$CLONE/build/compilers/ICC/5.0.1/lib/libircmt.lib"
