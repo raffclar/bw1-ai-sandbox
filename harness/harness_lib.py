@@ -8,7 +8,7 @@ Subcommands
   pick      choose one unit and up to N functions from an objdiff report
   compare   compare a baseline report with the post-run report for one unit
   limits    check / record the per-day PR and spend counters
-  cost      sum total_cost_usd from a Claude Code stream-json transcript
+  cost      sum total_cost_usd and detect usage/rate limits in a Claude Code transcript
   prbody    render the pull-request body
   paths     check that changed files stay inside the allowed paths
   render    fill the agent prompt template from a pick result
@@ -21,6 +21,7 @@ import datetime as dt
 import fnmatch
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -192,11 +193,19 @@ def cmd_limits(args: argparse.Namespace) -> int:
         reasons = []
         if day["prs"] >= args.max_prs_per_day:
             reasons.append(f'PR limit reached ({day["prs"]}/{args.max_prs_per_day} today)')
-        if day["usd"] >= args.max_usd_per_day:
+        # Dollar caps apply to API-key billing only; under a subscription the figure is an estimate.
+        if args.enforce_usd and day["usd"] >= args.max_usd_per_day:
             reasons.append(f'spend limit reached (${day["usd"]:.2f}/${args.max_usd_per_day:.2f} today)')
+        until = state.get("backoff_until")
+        if until:
+            try:
+                if dt.datetime.now(dt.timezone.utc) < dt.datetime.fromisoformat(until):
+                    reasons.append(f"usage/rate-limit back-off until {until}")
+            except ValueError:
+                pass
         if day["runs"] >= args.max_runs_per_day:
             reasons.append(f'run limit reached ({day["runs"]}/{args.max_runs_per_day} today)')
-        print(json.dumps({"ok": not reasons, "reasons": reasons, "today": day}))
+        print(json.dumps({"ok": not reasons, "reasons": reasons, "today": day, "enforce_usd": args.enforce_usd}))
         return 0 if not reasons else 1
     if args.action == "run":
         day["runs"] += 1
@@ -204,6 +213,12 @@ def cmd_limits(args: argparse.Namespace) -> int:
         day["prs"] += 1
     elif args.action == "spend":
         day["usd"] = round(day["usd"] + float(args.amount or 0.0), 4)
+    elif args.action == "backoff":
+        until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=args.minutes or 0)
+        if args.reset_epoch:
+            reset = dt.datetime.fromtimestamp(args.reset_epoch, dt.timezone.utc)
+            until = max(until, reset)
+        state["backoff_until"] = until.isoformat()
     elif args.action == "attempt":
         stamp = dt.datetime.now(dt.timezone.utc).isoformat()
         for key in args.keys or []:
@@ -216,9 +231,24 @@ def cmd_limits(args: argparse.Namespace) -> int:
 # --- cost -------------------------------------------------------------------------------
 
 
+# Text Claude Code / the API produce when a subscription usage limit or a rate limit is hit,
+# e.g. "Claude AI usage limit reached|1760140800", "rate_limit_error", HTTP 429.
+LIMIT_PATTERN = re.compile(
+    r"usage limit|rate[ _-]?limit|rate_limit_error|limit reached|too many requests|\b429\b|quota",
+    re.IGNORECASE,
+)
+RESET_PATTERN = re.compile(r"limit reached\|(\d{10})")
+
+
 def cmd_cost(args: argparse.Namespace) -> int:
-    """Claude Code's stream-json ends with a {"type": "result", "total_cost_usd": ...} line."""
-    total, turns, subtype = 0.0, None, None
+    """Claude Code's stream-json ends with a {"type": "result", "total_cost_usd": ...} line.
+
+    Also reports whether the run stopped on a usage or rate limit, from the final result, error
+    messages in the stream, or the agent's stderr.
+    """
+    total, turns, subtype, is_error = 0.0, None, None, False
+    limit_text, reset_epoch = "", None
+    texts, result_text = [], ""
     path = Path(args.transcript)
     if path.exists():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -233,7 +263,38 @@ def cmd_cost(args: argparse.Namespace) -> int:
                 total = _num(msg.get("total_cost_usd"), total)
                 turns = msg.get("num_turns", turns)
                 subtype = msg.get("subtype", subtype)
-    print(json.dumps({"usd": round(total, 4), "turns": turns, "subtype": subtype}))
+                is_error = bool(msg.get("is_error", is_error))
+                result_text = str(msg.get("result", ""))
+            elif msg.get("type") == "error" or msg.get("error"):
+                texts.append(json.dumps(msg))
+    failed = is_error or args.exit_code not in (None, 0)
+    if failed and args.stderr and Path(args.stderr).exists():
+        texts.append(Path(args.stderr).read_text(encoding="utf-8", errors="replace")[-4000:])
+    # Only error messages, and the final result and stderr of a failed run, are searched: the
+    # agent's own conversation may mention "limit" for unrelated reasons.
+    if failed:
+        texts.append(result_text)
+    for text in texts:
+        match = LIMIT_PATTERN.search(text)
+        if match:
+            limit_text = text[max(0, match.start() - 80) : match.end() + 80].replace("\n", " ")
+            reset = RESET_PATTERN.search(text)
+            if reset:
+                reset_epoch = int(reset.group(1))
+            break
+    print(
+        json.dumps(
+            {
+                "usd": round(total, 4),
+                "turns": turns,
+                "subtype": subtype,
+                "is_error": is_error,
+                "rate_limited": bool(limit_text),
+                "limit_text": limit_text,
+                "reset_epoch": reset_epoch,
+            }
+        )
+    )
     return 0
 
 
@@ -352,17 +413,22 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("limits")
-    p.add_argument("action", choices=["check", "run", "pr", "spend", "attempt"])
+    p.add_argument("action", choices=["check", "run", "pr", "spend", "attempt", "backoff"])
     p.add_argument("--state", required=True)
     p.add_argument("--max-prs-per-day", type=int, default=3)
     p.add_argument("--max-usd-per-day", type=float, default=25.0)
     p.add_argument("--max-runs-per-day", type=int, default=12)
     p.add_argument("--amount", type=float)
     p.add_argument("--keys", nargs="*")
+    p.add_argument("--enforce-usd", type=int, choices=[0, 1], default=1)
+    p.add_argument("--minutes", type=float)
+    p.add_argument("--reset-epoch", type=int)
     p.set_defaults(func=cmd_limits)
 
     p = sub.add_parser("cost")
     p.add_argument("--transcript", required=True)
+    p.add_argument("--stderr")
+    p.add_argument("--exit-code", type=int)
     p.set_defaults(func=cmd_cost)
 
     p = sub.add_parser("prbody")

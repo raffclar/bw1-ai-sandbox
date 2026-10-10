@@ -3,8 +3,15 @@
 # `plan -destroy` and teardown work without them, but the droplet has a precondition that
 # refuses to create or update anything while either is empty.
 
+variable "claude_oauth_token" {
+  description = "Claude subscription token made with `claude setup-token` (preferred). Passed to Claude Code as CLAUDE_CODE_OAUTH_TOKEN. Set TF_VAR_claude_oauth_token; never put it in a file."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 variable "anthropic_api_key" {
-  description = "Anthropic API key for Claude Code on the droplet. Set TF_VAR_anthropic_api_key; never put it in a file."
+  description = "Anthropic API key, the alternative to claude_oauth_token (used only when that is empty). Set TF_VAR_anthropic_api_key; never put it in a file."
   type        = string
   default     = ""
   sensitive   = true
@@ -179,13 +186,13 @@ variable "max_turns" {
 }
 
 variable "max_usd_per_run" {
-  description = "Agent spend cap per run in USD (claude --max-budget-usd)."
+  description = "Agent spend cap per run in USD (claude --max-budget-usd). API-key mode only; under a subscription there is no dollar cap."
   type        = number
   default     = 5
 }
 
 variable "max_usd_per_day" {
-  description = "No new run starts once the day's recorded agent spend reaches this (UTC day)."
+  description = "No new run starts once the day's recorded agent spend reaches this (UTC day). Enforced in API-key mode only; subscription runs log an estimate."
   type        = number
   default     = 25
 }
@@ -218,4 +225,10 @@ variable "max_functions" {
   description = "Functions handed to the agent per run (all from one unit)."
   type        = number
   default     = 4
+}
+
+variable "rate_limit_backoff_min" {
+  description = "After a run hits a subscription usage limit or an API rate limit, no run starts for this many minutes (or until the reset time Claude Code reports, if later)."
+  type        = number
+  default     = 180
 }

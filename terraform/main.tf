@@ -4,7 +4,16 @@ locals {
   pr_repo     = var.pr_repo != "" ? var.pr_repo : var.fork_repo
 
   # The guard: nothing is created or changed until both keys are supplied.
-  keys_ready = trimspace(var.anthropic_api_key) != "" && trimspace(var.github_token) != ""
+  # A Claude credential (subscription OAuth token, preferred, or API key) and the GitHub token.
+  claude_auth_mode = trimspace(var.claude_oauth_token) != "" ? "oauth" : (trimspace(var.anthropic_api_key) != "" ? "api-key" : "none")
+  keys_ready       = local.claude_auth_mode != "none" && trimspace(var.github_token) != ""
+
+  # Only the credential in use goes to the droplet.
+  secrets_env = join("", [
+    local.claude_auth_mode == "oauth" ? "CLAUDE_CODE_OAUTH_TOKEN=${var.claude_oauth_token}\n" : "",
+    local.claude_auth_mode == "api-key" ? "ANTHROPIC_API_KEY=${var.anthropic_api_key}\n" : "",
+    "GH_TOKEN=${var.github_token}\n",
+  ])
 
   # Non-secret settings, written to /etc/bw1-harness/config.env.
   config_env = join("\n", [
@@ -31,6 +40,7 @@ locals {
     "MAX_OPEN_PRS=${var.max_open_prs}",
     "MAX_USD_PER_DAY=${var.max_usd_per_day}",
     "MAX_RUNS_PER_DAY=${var.max_runs_per_day}",
+    "RATE_LIMIT_BACKOFF_MIN=${var.rate_limit_backoff_min}",
     "MAX_FUNCTIONS=${var.max_functions}",
     "MIN_SIZE=16",
     "MAX_SIZE=600",
@@ -73,7 +83,7 @@ resource "digitalocean_droplet" "harness" {
 
     precondition {
       condition     = local.keys_ready
-      error_message = "Refusing to deploy: the Anthropic API key and the GitHub token must both be set (TF_VAR_anthropic_api_key and TF_VAR_github_token; deploy.ps1 does this from the tokens file)."
+      error_message = "Refusing to deploy: a Claude credential (TF_VAR_claude_oauth_token from `claude setup-token`, or TF_VAR_anthropic_api_key) and the GitHub token (TF_VAR_github_token) must be set. deploy.ps1 does this from the tokens file."
     }
     precondition {
       condition     = can(regex("^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$", var.fork_repo))
@@ -167,14 +177,14 @@ resource "terraform_data" "provision" {
     data.archive_file.harness.output_sha256,
     sha256(local.config_env),
     sha256(local.setup_env),
-    sha256("${var.anthropic_api_key}\n${var.github_token}"),
+    sha256("${var.claude_oauth_token}\n${var.anthropic_api_key}\n${var.github_token}"),
     length(terraform_data.orig_upload) > 0 ? terraform_data.orig_upload[0].id : "no-archive",
   ]
 
   lifecycle {
     precondition {
       condition     = local.keys_ready
-      error_message = "Refusing to provision: the Anthropic API key and the GitHub token must both be set."
+      error_message = "Refusing to provision: a Claude credential (OAuth token or API key) and the GitHub token must be set."
     }
   }
 
@@ -205,7 +215,7 @@ resource "terraform_data" "provision" {
   }
 
   provisioner "file" {
-    content     = "ANTHROPIC_API_KEY=${var.anthropic_api_key}\nGH_TOKEN=${var.github_token}\n"
+    content     = local.secrets_env
     destination = "/etc/bw1-harness/secrets.env"
   }
 

@@ -42,7 +42,7 @@ source "$CONFIG_FILE"
 : "${CYCLES_PER_FUNCTION:=12}" "${MAX_PRS_PER_DAY:=3}" "${MAX_OPEN_PRS:=5}" "${MAX_USD_PER_DAY:=25}"
 : "${MAX_RUNS_PER_DAY:=12}" "${MAX_FUNCTIONS:=4}" "${MIN_SIZE:=16}" "${MAX_SIZE:=600}"
 : "${MIN_FUZZY:=50}" "${MAX_FUZZY:=99.5}" "${COOLDOWN_DAYS:=7}" "${MIN_FUZZY_GAIN:=0.5}"
-: "${ALLOWED_PATHS:=src/*,include/*}" "${VENV_DIR:=/opt/bw1-harness/venv}"
+: "${ALLOWED_PATHS:=src/*,include/*}" "${VENV_DIR:=/opt/bw1-harness/venv}" "${RATE_LIMIT_BACKOFF_MIN:=180}"
 
 if [[ -z "$BRANCH_PREFIX" || "$BRANCH_PREFIX" != */ || "$BRANCH_PREFIX" == main* || "$BRANCH_PREFIX" == master* ]]; then
 	echo "BRANCH_PREFIX must be a namespace ending in '/', e.g. harness/" >&2
@@ -95,30 +95,50 @@ else
 	die "flock (util-linux) is required"
 fi
 
-# --- secrets: both keys must exist, else refuse ----------------------------------------------
+# --- secrets: a Claude credential and the GitHub token must exist, else refuse ----------------
+# Claude: CLAUDE_CODE_OAUTH_TOKEN (subscription, from `claude setup-token`; preferred) or
+# ANTHROPIC_API_KEY (API billing). If both are present the OAuth token is used.
+CLAUDE_CODE_OAUTH_TOKEN=""
 ANTHROPIC_API_KEY=""
 GH_TOKEN=""
 if [[ -r "$SECRETS_FILE" ]]; then
 	while IFS='=' read -r key value; do
 		case "$key" in
+		CLAUDE_CODE_OAUTH_TOKEN) CLAUDE_CODE_OAUTH_TOKEN="$value" ;;
 		ANTHROPIC_API_KEY) ANTHROPIC_API_KEY="$value" ;;
 		GH_TOKEN) GH_TOKEN="$value" ;;
 		esac
 	done <"$SECRETS_FILE"
 fi
-if ((DRY_RUN)); then
-	log "[dry-run] secrets: ANTHROPIC_API_KEY $([[ -n "$ANTHROPIC_API_KEY" ]] && echo present || echo MISSING), GH_TOKEN $([[ -n "$GH_TOKEN" ]] && echo present || echo MISSING) (a real run refuses unless both are present)"
+if [[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+	AUTH_MODE=oauth
+elif [[ -n "$ANTHROPIC_API_KEY" ]]; then
+	AUTH_MODE=api-key
 else
-	[[ -n "$ANTHROPIC_API_KEY" ]] || die "ANTHROPIC_API_KEY missing in $SECRETS_FILE: refusing to run" 2
+	AUTH_MODE=none
+fi
+# Dollar caps only mean something when the API key is billed per token.
+ENFORCE_USD=0
+[[ "$AUTH_MODE" == api-key ]] && ENFORCE_USD=1
+if ((DRY_RUN)); then
+	log "[dry-run] secrets: claude auth mode $AUTH_MODE, GH_TOKEN $([[ -n "$GH_TOKEN" ]] && echo present || echo MISSING) (a real run refuses unless both are present)"
+else
+	[[ "$AUTH_MODE" != none ]] || die "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY in $SECRETS_FILE: refusing to run" 2
 	[[ -n "$GH_TOKEN" ]] || die "GH_TOKEN missing in $SECRETS_FILE: refusing to run" 2
 fi
+case "$AUTH_MODE" in
+oauth) log "claude auth mode: oauth (subscription: dollar figures are estimates, not enforced)" ;;
+api-key) log "claude auth mode: api-key (dollar caps enforced)" ;;
+*) log "claude auth mode: none (dry run only; a real run refuses here)" ;;
+esac
 
 # gh and git get the token only through these wrappers; the agent never sees it.
 gh_() { GH_TOKEN="$GH_TOKEN" GH_PROMPT_DISABLED=1 gh "$@"; }
 git_() { git -C "$REPO_DIR" -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" "$@"; }
 
 # --- daily limits ----------------------------------------------------------------------------
-LIMIT_ARGS=(--state "$STATE_FILE" --max-prs-per-day "$MAX_PRS_PER_DAY" --max-usd-per-day "$MAX_USD_PER_DAY" --max-runs-per-day "$MAX_RUNS_PER_DAY")
+LIMIT_ARGS=(--state "$STATE_FILE" --max-prs-per-day "$MAX_PRS_PER_DAY" --max-usd-per-day "$MAX_USD_PER_DAY"
+	--max-runs-per-day "$MAX_RUNS_PER_DAY" --enforce-usd "$ENFORCE_USD")
 if ! limits="$("${LIB[@]}" limits check "${LIMIT_ARGS[@]}")"; then
 	die "daily limit: $limits" 0
 fi
@@ -186,27 +206,53 @@ check_stop
 DISALLOWED="Bash(git push:*),Bash(git commit:*),Bash(git reset:*),Bash(git rebase:*),Bash(git checkout:*),Bash(git switch:*),Bash(git stash:*),Bash(git remote:*),Bash(git config:*),Bash(gh:*),Bash(curl:*),Bash(wget:*),Bash(ssh:*),Bash(scp:*),Bash(sudo:*),WebFetch,WebSearch"
 CLAUDE_ARGS=(-p --model "$CLAUDE_MODEL" --max-turns "$MAX_TURNS" --output-format stream-json --verbose
 	--permission-mode bypassPermissions --disallowedTools "$DISALLOWED")
-if command -v claude >/dev/null 2>&1 && claude --help 2>/dev/null | grep -q -- '--max-budget-usd'; then
+if [[ "$AUTH_MODE" != api-key ]]; then
+	log "subscription mode: no --max-budget-usd; bounded by --max-turns, the timeout and the run/PR caps"
+elif command -v claude >/dev/null 2>&1 && claude --help 2>/dev/null | grep -q -- '--max-budget-usd'; then
 	CLAUDE_ARGS+=(--max-budget-usd "$MAX_USD_PER_RUN")
 else
 	log "WARNING: this claude has no --max-budget-usd; relying on --max-turns, the timeout and the daily cap"
 fi
 
-if ((DRY_RUN)); then
-	log "[dry-run] would run (in $REPO_DIR, ANTHROPIC_API_KEY=<redacted>, GH_TOKEN unset): timeout ${RUN_TIMEOUT_MIN}m claude ${CLAUDE_ARGS[*]} < $RUN_DIR/prompt.md"
+# Only the credential in use reaches claude; the other is unset so it cannot take precedence.
+# GH_TOKEN never reaches the agent.
+if [[ "$AUTH_MODE" == oauth ]]; then
+	AGENT_ENV=(env -u GH_TOKEN -u GITHUB_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN
+		CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
+	AGENT_ENV_SHOWN="CLAUDE_CODE_OAUTH_TOKEN=<redacted>, ANTHROPIC_API_KEY unset"
 else
-	log "agent start: model $CLAUDE_MODEL, max turns $MAX_TURNS, \$$MAX_USD_PER_RUN, ${RUN_TIMEOUT_MIN}m"
+	AGENT_ENV=(env -u GH_TOKEN -u GITHUB_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_AUTH_TOKEN
+		ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
+	AGENT_ENV_SHOWN="ANTHROPIC_API_KEY=<redacted>, CLAUDE_CODE_OAUTH_TOKEN unset"
+fi
+
+if ((DRY_RUN)); then
+	log "[dry-run] would run (in $REPO_DIR, auth $AUTH_MODE: $AGENT_ENV_SHOWN, GH_TOKEN unset): timeout ${RUN_TIMEOUT_MIN}m claude ${CLAUDE_ARGS[*]} < $RUN_DIR/prompt.md"
+else
+	log "agent start: auth $AUTH_MODE, model $CLAUDE_MODEL, max turns $MAX_TURNS, ${RUN_TIMEOUT_MIN}m$([[ $ENFORCE_USD == 1 ]] && echo ", \$$MAX_USD_PER_RUN cap")"
 	set +e
-	env -u GH_TOKEN -u GITHUB_TOKEN ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" DISABLE_AUTOUPDATER=1 \
+	"${AGENT_ENV[@]}" DISABLE_AUTOUPDATER=1 \
 		PATH="$VENV_DIR/bin:$PATH" \
 		timeout --kill-after=60 "${RUN_TIMEOUT_MIN}m" claude "${CLAUDE_ARGS[@]}" <"$RUN_DIR/prompt.md" \
 		>"$RUN_DIR/transcript.jsonl" 2>"$RUN_DIR/agent-stderr.log"
 	agent_exit=$?
 	set -e
-	cost_json="$("${LIB[@]}" cost --transcript "$RUN_DIR/transcript.jsonl")"
-	COST="$("$PY" -c "import json,sys; print(json.loads(sys.argv[1])['usd'])" "$cost_json")"
+	cost_json="$("${LIB[@]}" cost --transcript "$RUN_DIR/transcript.jsonl" --stderr "$RUN_DIR/agent-stderr.log" --exit-code "$agent_exit")"
+	field() { "$PY" -c "import json,sys; v=json.loads(sys.argv[1]).get(sys.argv[2]); print('' if v is None else v)" "$cost_json" "$1"; }
+	COST="$(field usd)"
 	"${LIB[@]}" limits spend "${LIMIT_ARGS[@]}" --amount "$COST" >/dev/null
-	log "agent exit $agent_exit, $cost_json"
+	log "agent exit $agent_exit, auth $AUTH_MODE, $cost_json"
+	if [[ "$(field rate_limited)" == True ]]; then
+		# Usage or rate limit: stop this run cleanly and pause runs instead of retrying in a loop.
+		reset_epoch="$(field reset_epoch)"
+		"${LIB[@]}" limits backoff "${LIMIT_ARGS[@]}" --minutes "$RATE_LIMIT_BACKOFF_MIN" \
+			${reset_epoch:+--reset-epoch "$reset_epoch"} >"$RUN_DIR/backoff.json"
+		log "usage/rate limit hit ($AUTH_MODE): $(cat "$RUN_DIR/backoff.json"); discarding this run"
+		git_ reset -q --hard "$BASE_SHA"
+		git_ clean -q -fd -e build/ -e orig/
+		log "=== run end (rate limited) ==="
+		exit 0
+	fi
 fi
 COST="${COST:-0}"
 check_stop
