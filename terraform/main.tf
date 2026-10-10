@@ -80,6 +80,10 @@ resource "digitalocean_droplet" "harness" {
       error_message = "Set fork_repo (owner/name of the fork the GitHub token can push to)."
     }
     precondition {
+      condition     = lower(split("/", var.fork_repo)[0]) != "openblack"
+      error_message = "fork_repo must be your own fork (raffclar/bw1-decomp), never an openblack repository: branches are only pushed there."
+    }
+    precondition {
       condition     = var.orig_source != "archive" || (var.orig_archive_path != "" && fileexists(var.orig_archive_path))
       error_message = "orig_source = \"archive\" needs orig_archive_path pointing at an existing .tar.gz (scripts/pack-orig.ps1 makes one)."
     }

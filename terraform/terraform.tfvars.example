@@ -6,7 +6,7 @@
 ssh_allowed_cidrs = ["203.0.113.7/32"] # your public IP
 
 # The fork the GitHub token can push to (branches go here, never to upstream).
-fork_repo = "your-github-user/bw1-decomp"
+fork_repo = "raffclar/bw1-decomp"
 # Empty: PRs open against the fork. "openblack/bw1-decomp": PRs open upstream.
 pr_repo  = ""
 pr_draft = true

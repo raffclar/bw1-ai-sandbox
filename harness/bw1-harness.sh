@@ -36,6 +36,7 @@ source "$CONFIG_FILE"
 
 : "${REPO_DIR:?}" "${STATE_DIR:?}" "${LOG_DIR:?}" "${STOP_FILE:?}" "${VERSION:=BW1W120}"
 : "${UPSTREAM_REPO:?}" "${FORK_REPO:?}" "${PR_REPO:=$FORK_REPO}" "${PR_BASE:=main}" "${PR_DRAFT:=true}"
+[[ "${FORK_REPO,,}" == openblack/* ]] && { echo "FORK_REPO must be your own fork, never openblack/*" >&2; exit 2; }
 : "${BRANCH_PREFIX:=harness/}" "${GIT_AUTHOR_NAME:?}" "${GIT_AUTHOR_EMAIL:?}"
 : "${CLAUDE_MODEL:=claude-opus-5-5}" "${MAX_TURNS:=150}" "${MAX_USD_PER_RUN:=5}" "${RUN_TIMEOUT_MIN:=120}"
 : "${CYCLES_PER_FUNCTION:=12}" "${MAX_PRS_PER_DAY:=3}" "${MAX_OPEN_PRS:=5}" "${MAX_USD_PER_DAY:=25}"

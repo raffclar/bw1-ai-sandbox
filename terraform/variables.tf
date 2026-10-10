@@ -107,9 +107,9 @@ variable "upstream_repo" {
 }
 
 variable "fork_repo" {
-  description = "owner/name of the fork the token can push to. Branches go here, never to upstream."
+  description = "owner/name of the fork the token can push to. Branches go here, never to upstream (openblack)."
   type        = string
-  default     = ""
+  default     = "raffclar/bw1-decomp"
 }
 
 variable "pr_repo" {

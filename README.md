@@ -162,7 +162,9 @@ You will need:
      * Add Pull requests read/write on `openblack/bw1-decomp` if `pr_repo` points upstream.
      * For `orig_source = "ghcr"` you need a classic PAT with `read:packages` and access to the
        private `openblack/bw1-build` package.
-2. **A fork** of openblack/bw1-decomp under that account.
+2. **A fork** of openblack/bw1-decomp at `raffclar/bw1-decomp` (the default `fork_repo`; it does not exist yet, so create it
+   first). Branches are only ever pushed to raffclar, never to openblack: Terraform and the harness both refuse an
+   `openblack/*` fork_repo, and the clone's upstream remote has pushing disabled.
 3. **The game files**: `scripts/pack-orig.ps1 -OrigDir C:\projects\bw1-decomp\orig`, or one of the
    other sources above.
 4. **`terraform/terraform.tfvars`**: copy it from `terraform.tfvars.example`. Set at least
