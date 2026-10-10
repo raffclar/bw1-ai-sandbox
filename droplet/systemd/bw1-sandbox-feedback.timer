@@ -1,0 +1,9 @@
+[Unit]
+Description=bw1 sandbox: hand queued reviewer comments to their workers periodically
+
+[Timer]
+OnActiveSec=25min
+OnUnitInactiveSec=15min
+
+[Install]
+WantedBy=timers.target

@@ -36,6 +36,7 @@ Usage (as the `sandbox` user, from anywhere):
   sandbox_droplet.py portal [--port 8765] [--no-autoresume]
   sandbox_droplet.py mcp                             the orchestrator's MCP server (stdio)
   sandbox_droplet.py export --out FILE               fetch finished workers, write JSON for the publisher
+  sandbox_droplet.py feedback --dir FOLDER           resume workers with queued reviewer comments (optional)
 """
 
 import json
@@ -238,8 +239,37 @@ def main(argv) -> int:
         except sb_mod.SandboxError as e:
             print(f"sandbox: {e}", file=sys.stderr)
             return 1
+    if cmd == "feedback":
+        if rest[:1] != ["--dir"] or len(rest) != 2:
+            print("usage: sandbox_droplet.py feedback --dir FOLDER", file=sys.stderr)
+            return 2
+        return feedback(sb_mod, Path(rest[1]))
     print(f"unknown command {cmd!r}; see --help", file=sys.stderr)
     return 2
+
+
+def feedback(sb_mod, folder: Path) -> int:
+    """Optional (feedback_to_sandbox): resume each worker with the reviewer comments the publisher queued for
+    it in <folder>/<worker>.md, using the sandbox's own `resume` (a follow-up in the worker's session). A
+    worker that is still running keeps its file for the next run. Handled files are renamed *.sent."""
+    import re
+    sb = sb_mod.Sandbox()
+    running = set(sb.running_workers())
+    for f in sorted(folder.glob("*.md")):
+        name = f.stem
+        if not re.match(r"^[A-Za-z0-9_-]+$", name):
+            print(f"skip {f.name}: bad worker name")
+            continue
+        if name in running:
+            print(f"{name}: still running; feedback kept for later")
+            continue
+        try:
+            print(sb.resume(name, f.read_text(encoding="utf-8")))
+        except sb_mod.SandboxError as e:
+            print(f"{name}: {e}")
+            continue
+        f.rename(f.with_suffix(f".{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.sent"))
+    return 0
 
 
 if __name__ == "__main__":

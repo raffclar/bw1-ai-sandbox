@@ -1,0 +1,10 @@
+[Unit]
+Description=bw1 sandbox: resume workers with reviewer comments queued by the publisher (feedback_to_sandbox)
+After=docker.service bw1-egress.service
+
+[Service]
+Type=oneshot
+User=sandbox
+Group=sandbox
+Environment=SANDBOX_DIR=/opt/bw1-sandbox/bw1-ai-sandbox
+ExecStart=/opt/bw1-sandbox/venv/bin/python3 /opt/bw1-sandbox/droplet/sandbox_droplet.py feedback --dir /var/lib/bw1-sandbox/feedback

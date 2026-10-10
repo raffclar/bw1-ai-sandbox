@@ -1,22 +1,21 @@
 # Copy to terraform.tfvars (gitignored) and fill in. NO SECRETS IN THIS FILE: the DigitalOcean
-# token, the Claude subscription token, the GitHub token and any bw1-build token come from the
-# environment only (deploy.ps1 sets DIGITALOCEAN_TOKEN and the TF_VAR_* variables from the tokens file).
+# token, the Claude subscription token and the GitHub tokens come from the environment only
+# (deploy.ps1 sets DIGITALOCEAN_TOKEN and the TF_VAR_* variables from the tokens file).
 
 ssh_allowed_cidrs = ["203.0.113.7/32"] # your public IP
 
-# Your fork: the publisher pushes ai-sandbox/* branches and opens draft PRs here only.
+# Your fork: the ONLY place the publisher pushes (new ai-sandbox/* branches).
 fork_repo = "raffclar/bw1-decomp"
+
+# Where the draft PRs go: "fork" (raffclar/bw1-decomp) or "openblack" (openblack/bw1-decomp, head
+# raffclar:<branch>; needs "github_openblack_pr" in the tokens file, see scripts/new-github-credentials.ps1).
+pr_target = "fork"
 
 # Original game files. Default: your zip (single top folder bw1-original/ or orig/), uploaded to the
 # droplet host, unpacked into bw1-decomp/orig/ there, verified, then deleted. A .tar.gz from
 # scripts/pack-orig.ps1 works too.
 orig_source       = "archive"
 orig_archive_path = "E:/bw1-original.zip"
-# Alternative: clone the private openblack/bw1-build repo on the droplet host (needs a read-only deploy
-# key from scripts/new-bw1-build-key.ps1, or "github_bw1_build" in the tokens file):
-# orig_source        = "git"
-# game_version       = "BW1W120"
-# keep_bw1_build_key = false
 
 # do_project_id        = "0a017c67-5e46-4f17-9a26-d8f40de0ae7b"   # existing project "for bw1-decomp"
 # region               = "lon1"
@@ -41,3 +40,8 @@ orig_archive_path = "E:/bw1-original.zip"
 # max_prs_per_day  = 3
 # max_open_prs     = 5
 # allowed_paths    = ["src/*", "include/*", "tools/matching_ledger.jsonl"]
+
+# Reviewer comments on harness PRs are collected every 15 minutes. Optionally feed them back to the
+# worker that made the PR (off by default; only comments from these logins, default the fork owner).
+# feedback_to_sandbox = false
+# feedback_authors    = ["raffclar"]

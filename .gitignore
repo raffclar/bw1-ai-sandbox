@@ -35,7 +35,7 @@ orig-*.tar.gz
 *.dll
 *.lib
 
-# Deploy keys for the private bw1-build repo (scripts/new-bw1-build-key.ps1)
+# Local keys (never committed)
 keys/
 
 # Python caches

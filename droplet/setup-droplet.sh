@@ -12,15 +12,14 @@
 #          publisher= holds the GitHub token; pushes branches and opens PRs on the fork
 #
 # Environment (set by Terraform): SANDBOX_REPO SANDBOX_REF UPSTREAM_REPO BW1_DECOMP_REF FORK_REPO
-#   ORIG_SOURCE GAME_VERSION BW1_BUILD_REPO BW1_BUILD_REF KEEP_BW1_BUILD_KEY WORKER_CPUS WORKER_MEMORY PUBLISH_INTERVAL PUBLISHER_ENABLED AUTORESUME_ENABLED
+#   ORIG_SOURCE GAME_VERSION FEEDBACK_TO_SANDBOX WORKER_CPUS WORKER_MEMORY PUBLISH_INTERVAL PUBLISHER_ENABLED AUTORESUME_ENABLED
 #   PORTAL_ENABLED ORCHESTRATOR_TOOLS CLAUDE_VERSION
 set -Eeuo pipefail
 
 : "${SANDBOX_REPO:=https://github.com/bwrsandman/bw1-ai-sandbox.git}"
 : "${SANDBOX_REF:?pin the sandbox to a commit}"
 : "${UPSTREAM_REPO:=openblack/bw1-decomp}" "${BW1_DECOMP_REF:=main}" "${FORK_REPO:?}"
-: "${ORIG_SOURCE:=archive}" "${GAME_VERSION:=BW1W120}" "${BW1_BUILD_REPO:=openblack/bw1-build}" "${BW1_BUILD_REF:=main}"
-: "${KEEP_BW1_BUILD_KEY:=false}" "${WORKER_CPUS:=2}" "${WORKER_MEMORY:=4g}" "${PUBLISH_INTERVAL:=30min}"
+: "${ORIG_SOURCE:=archive}" "${GAME_VERSION:=BW1W120}" "${FEEDBACK_TO_SANDBOX:=false}" "${WORKER_CPUS:=2}" "${WORKER_MEMORY:=4g}" "${PUBLISH_INTERVAL:=30min}"
 : "${PUBLISHER_ENABLED:=true}" "${AUTORESUME_ENABLED:=true}" "${PORTAL_ENABLED:=false}"
 : "${ORCHESTRATOR_TOOLS:=true}" "${CLAUDE_VERSION:=stable}"
 
@@ -52,7 +51,7 @@ as() { local u="$1"; shift; sudo -u "$u" -H "$@"; }
 say "packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q docker.io git git-lfs rsync python3 python3-venv python3-libvirt ninja-build openssh-server \
+apt-get install -y -q docker.io git rsync python3 python3-venv python3-libvirt ninja-build openssh-server \
 	iptables curl ca-certificates sudo iproute2 tmux
 if ! command -v gh >/dev/null; then
 	install -m 0755 -d /etc/apt/keyrings
@@ -131,61 +130,15 @@ as sandbox git -C "$CLONE" remote set-url --push origin DISABLED
 
 say "original game files ($ORIG_SOURCE, $GAME_VERSION)"
 # The game files stay on the host: in the sandbox's clone (sandbox user, 0750) and the read-only copy
-# `sync` makes for workers. The bw1-build credential is used here only, by root, and never reaches
-# GH_TOKEN, the sandbox user or a worker.
-BW1_BUILD_DIR=/var/lib/bw1-build/bw1-build
-BW1_BUILD_KEY=$ETC/bw1-build-deploy-key
-BW1_BUILD_TOKEN_FILE=$ETC/bw1-build-token.env
-GITHUB_KNOWN_HOSTS=/var/lib/bw1-build/known_hosts
-fetch_bw1_build() {
-	install -d -m 0700 /var/lib/bw1-build
-	# GitHub's published SSH host key: no trust-on-first-use.
-	echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >"$GITHUB_KNOWN_HOSTS"
-	local url include="orig/$GAME_VERSION/**,orig/libs/**,orig/directx7.0/**"
-	local -a auth=()
-	export GIT_LFS_SKIP_SMUDGE=1 # no LFS objects at clone time; only the version in use, below
-	if [[ -s "$BW1_BUILD_KEY" ]]; then
-		chmod 0600 "$BW1_BUILD_KEY"
-		export GIT_SSH_COMMAND="ssh -i $BW1_BUILD_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$GITHUB_KNOWN_HOSTS -o StrictHostKeyChecking=yes"
-		url="git@github.com:$BW1_BUILD_REPO.git"
-	elif [[ -s "$BW1_BUILD_TOKEN_FILE" ]]; then
-		# shellcheck disable=SC2016 # expanded by git's credential helper shell, from the environment
-		auth=(-c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$BW1_BUILD_TOKEN"; }; f')
-		BW1_BUILD_TOKEN="$(sed -n 's/^BW1_BUILD_TOKEN=//p' "$BW1_BUILD_TOKEN_FILE")"
-		export BW1_BUILD_TOKEN
-		url="https://github.com/$BW1_BUILD_REPO.git"
-	else
-		echo "ERROR: no bw1-build credential (deploy key or token) on the droplet" >&2
-		return 1
-	fi
-	if [[ ! -d "$BW1_BUILD_DIR/.git" ]]; then
-		git "${auth[@]}" clone -q --depth 1 --branch "$BW1_BUILD_REF" "$url" "$BW1_BUILD_DIR"
-	else
-		git "${auth[@]}" -C "$BW1_BUILD_DIR" fetch -q --depth 1 origin "$BW1_BUILD_REF"
-		git -C "$BW1_BUILD_DIR" reset -q --hard FETCH_HEAD
-	fi
-	git -C "$BW1_BUILD_DIR" lfs install --local >/dev/null
-	git "${auth[@]}" -C "$BW1_BUILD_DIR" lfs pull --include "$include"
-	unset GIT_SSH_COMMAND BW1_BUILD_TOKEN GIT_LFS_SKIP_SMUDGE
-	# Any file still an LFS pointer means the pull did not get it.
-	if grep -rlI --include='*.exe' --include='*.dll' --include='*.lib' '^version https://git-lfs' \
-		"$BW1_BUILD_DIR/orig/$GAME_VERSION" "$BW1_BUILD_DIR/orig/libs" "$BW1_BUILD_DIR/orig/directx7.0" | head -n 5 | grep .; then
-		echo "ERROR: LFS pointers left after git lfs pull (above)" >&2
-		return 1
-	fi
-	as sandbox mkdir -p "$CLONE/orig"
-	rsync -a --delete "$BW1_BUILD_DIR/orig/$GAME_VERSION/" "$CLONE/orig/$GAME_VERSION/"
-	rsync -a --delete "$BW1_BUILD_DIR/orig/libs/" "$CLONE/orig/libs/"
-	rsync -a --delete "$BW1_BUILD_DIR/orig/directx7.0/" "$CLONE/orig/directx7.0/"
-	chown -R sandbox:sandbox "$CLONE/orig"
-}
+# `sync` makes for workers.
 case "$ORIG_SOURCE" in
-git) fetch_bw1_build ;;
 archive)
 	# bw1-original.zip (top folder bw1-original/) or a pack-orig.ps1 .tar.gz (top folder orig/). unpack-orig.py
 	# refuses any other top folder, path traversal and links; it unpacks into a fresh folder first.
 	ARCHIVE=""
-	for a in "$BASE/incoming/orig-archive.zip" "$BASE/incoming/orig-archive.tar.gz"; do [[ -f "$a" ]] && ARCHIVE="$a"; done
+	for a in "$BASE/incoming/orig-archive.zip" "$BASE/incoming/orig-archive.tar.gz"; do
+		if [[ -f "$a" ]]; then ARCHIVE="$a"; fi
+	done
 	if [[ -n "$ARCHIVE" ]]; then
 		STAGE="$(mktemp -d /var/lib/bw1-orig-stage.XXXXXX)"
 		python3 "$DROPLET/unpack-orig.py" "$ARCHIVE" "$STAGE"
@@ -207,14 +160,6 @@ else
 fi
 # Unpacked and verified: the uploaded archive is no longer needed.
 if [[ -n "${UNPACKED_ARCHIVE:-}" ]]; then rm -f "$UNPACKED_ARCHIVE"; fi
-if [[ "$KEEP_BW1_BUILD_KEY" != true ]]; then
-	# Verified: the credential is no longer needed on the droplet.
-	for f in "$BW1_BUILD_KEY" "$BW1_BUILD_TOKEN_FILE"; do
-		[[ -e "$f" ]] && { shred -u "$f" 2>/dev/null || rm -f "$f"; }
-	done
-fi
-[[ -s "$BW1_BUILD_TOKEN_FILE" ]] || rm -f "$BW1_BUILD_TOKEN_FILE"
-[[ -s "$BW1_BUILD_KEY" ]] || rm -f "$BW1_BUILD_KEY"
 
 say "host toolchain (sandbox README step 3)"
 as sandbox bash -c "cd '$CLONE' && python3 configure.py --version $GAME_VERSION && ninja build/tools/dtk build/compilers/MSVC/$MSVC"
@@ -257,10 +202,14 @@ systemctl enable --now ssh
 
 say "GitHub token for the publisher"
 install -d -m 0755 "$ETC"
-if [[ -f $ETC/github.env ]]; then
-	chown publisher:publisher "$ETC/github.env"
-	chmod 0600 "$ETC/github.env"
-fi
+# Fork credential and the openblack PR-only credential: publisher only, never git's credential store,
+# never the sandbox user or a worker.
+for f in github.env github-openblack-pr.env; do
+	if [[ -f $ETC/$f ]]; then
+		chown publisher:publisher "$ETC/$f"
+		chmod 0600 "$ETC/$f"
+	fi
+done
 chown root:root "$ETC/publisher.env" "$ETC/egress.conf"
 chmod 0644 "$ETC/publisher.env" "$ETC/egress.conf"
 
@@ -285,6 +234,7 @@ install -d -o publisher -g publisher /var/log/bw1-publisher
 if [[ ! -d "$PUB_CLONE" ]]; then
 	as publisher git clone -q --bare "https://github.com/$UPSTREAM_REPO.git" "$PUB_CLONE"
 fi
+# origin = openblack, fetch only: its push URL is disabled (the publisher never pushes there).
 as publisher git -C "$PUB_CLONE" remote set-url --push origin DISABLED
 as publisher git -C "$PUB_CLONE" remote get-url fork >/dev/null 2>&1 ||
 	as publisher git -C "$PUB_CLONE" remote add fork "https://github.com/$FORK_REPO.git"
@@ -310,7 +260,9 @@ EOF
 chmod 0755 /usr/local/bin/bw1-sandbox
 
 say "services"
-for u in bw1-sandbox-autoresume.service bw1-sandbox-portal.service bw1-sandbox-export.service bw1-publisher.service; do
+install -d -o publisher -g sandbox -m 2770 /var/lib/bw1-sandbox/feedback
+for u in bw1-sandbox-autoresume.service bw1-sandbox-portal.service bw1-sandbox-export.service bw1-publisher.service \
+	bw1-publisher-comments.service bw1-publisher-comments.timer bw1-sandbox-feedback.service bw1-sandbox-feedback.timer; do
 	install -m 0644 "$DROPLET/systemd/$u" /etc/systemd/system/
 done
 sed "s|@PUBLISH_INTERVAL@|$PUBLISH_INTERVAL|" "$DROPLET/systemd/bw1-publisher.timer" >/etc/systemd/system/bw1-publisher.timer
@@ -319,4 +271,7 @@ toggle() { if [[ "$2" == true ]]; then systemctl enable --now "$1"; else systemc
 toggle bw1-sandbox-autoresume.service "$AUTORESUME_ENABLED"
 toggle bw1-sandbox-portal.service "$PORTAL_ENABLED"
 toggle bw1-publisher.timer "$PUBLISHER_ENABLED"
+toggle bw1-publisher-comments.timer "$PUBLISHER_ENABLED"
+# Off by default: reviewer comments become follow-up prompts for the worker that made the PR.
+toggle bw1-sandbox-feedback.timer "$FEEDBACK_TO_SANDBOX"
 say "done: no workers are running; spawn them with the orchestrator, the portal or bw1-sandbox spawn"

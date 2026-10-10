@@ -1,0 +1,15 @@
+[Unit]
+Description=bw1 sandbox: collect new comments and reviews on the harness's PRs
+After=network-online.target
+ConditionPathExists=!/etc/bw1-sandbox/STOP
+
+[Service]
+Type=oneshot
+User=publisher
+Group=publisher
+UMask=0007
+ExecStart=/usr/bin/python3 /opt/bw1-sandbox/droplet/publisher.py --config /etc/bw1-sandbox/publisher.env comments
+TimeoutStartSec=15min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

@@ -5,11 +5,10 @@ locals {
   # The guard: nothing is created or changed until both secrets are supplied.
   keys_ready = trimspace(var.claude_oauth_token) != "" && trimspace(var.github_token) != ""
 
-  # bw1-build credential (orig_source = "git"): the deploy key if its file exists, else the token.
-  bw1_build_key_path = var.bw1_build_key_path != "" ? var.bw1_build_key_path : "${path.module}/../keys/bw1-build-deploy"
-  bw1_build_key      = var.orig_source == "git" && fileexists(local.bw1_build_key_path) ? sensitive(file(local.bw1_build_key_path)) : ""
-  bw1_build_token    = var.orig_source == "git" && local.bw1_build_key == "" ? trimspace(var.bw1_build_token) : ""
-  bw1_build_ready    = var.orig_source != "git" || local.bw1_build_key != "" || local.bw1_build_token != ""
+  # PRs on openblack need their own PR-only credential; PRs on the fork use the fork token.
+  pr_ready = var.pr_target != "openblack" || trimspace(var.openblack_pr_token) != ""
+  pr_repo  = var.pr_target == "openblack" ? var.upstream_repo : var.fork_repo
+
 
   # Uploaded archive keeps its type so the droplet knows how to unpack it.
   orig_archive_remote = "/opt/bw1-sandbox/incoming/orig-archive.${can(regex("(?i)\\.zip$", var.orig_archive_path)) ? "zip" : "tar.gz"}"
@@ -17,12 +16,15 @@ locals {
   publisher_env = join("\n", [
     "UPSTREAM_REPO=${var.upstream_repo}",
     "FORK_REPO=${var.fork_repo}",
-    "PR_REPO=${var.fork_repo}",
+    "PR_TARGET=${var.pr_target}",
+    "PR_REPO=${local.pr_repo}",
     "PR_BASE=main",
     "BRANCH_PREFIX=${var.branch_prefix}",
     "MAX_PRS_PER_DAY=${var.max_prs_per_day}",
     "MAX_OPEN_PRS=${var.max_open_prs}",
     "ALLOWED_PATHS=${join(",", var.allowed_paths)}",
+    "FEEDBACK_TO_SANDBOX=${var.feedback_to_sandbox}",
+    "FEEDBACK_AUTHORS=${join(",", var.feedback_authors)}",
     "",
   ])
 
@@ -40,12 +42,10 @@ locals {
     "FORK_REPO=${var.fork_repo}",
     "ORIG_SOURCE=${var.orig_source}",
     "GAME_VERSION=${var.game_version}",
-    "BW1_BUILD_REPO=${var.bw1_build_repo}",
-    "BW1_BUILD_REF=${var.bw1_build_ref}",
-    "KEEP_BW1_BUILD_KEY=${var.keep_bw1_build_key}",
     "WORKER_CPUS=${var.worker_cpus}",
     "WORKER_MEMORY=${var.worker_memory}",
     "PUBLISH_INTERVAL=${var.publish_interval}",
+    "FEEDBACK_TO_SANDBOX=${var.feedback_to_sandbox}",
     "PUBLISHER_ENABLED=${var.publisher_enabled}",
     "AUTORESUME_ENABLED=${var.autoresume_enabled}",
     "PORTAL_ENABLED=${var.portal_enabled}",
@@ -79,8 +79,8 @@ resource "digitalocean_droplet" "sandbox" {
       error_message = "Refusing to deploy: the Claude subscription token (TF_VAR_claude_oauth_token, from `claude setup-token`) and the GitHub token (TF_VAR_github_token) must both be set. deploy.ps1 does this from the tokens file."
     }
     precondition {
-      condition     = local.bw1_build_ready
-      error_message = "orig_source = \"git\" needs a credential for the private bw1-build repo: a read-only deploy key at bw1_build_key_path (scripts/new-bw1-build-key.ps1, recommended) or TF_VAR_bw1_build_token (tokens file key \"github_bw1_build\")."
+      condition     = local.pr_ready
+      error_message = "pr_target = \"openblack\" needs the PR-only credential for openblack (TF_VAR_openblack_pr_token, tokens file key \"github_openblack_pr\")."
     }
     precondition {
       condition     = var.orig_source != "archive" || (var.orig_archive_path != "" && fileexists(var.orig_archive_path))
@@ -176,7 +176,7 @@ resource "terraform_data" "provision" {
     sha256(local.publisher_env),
     sha256(local.egress_conf),
     sha256(local.setup_env),
-    sha256("${var.claude_oauth_token}\n${var.github_token}\n${local.bw1_build_key}\n${local.bw1_build_token}"),
+    sha256("${var.claude_oauth_token}\n${var.github_token}\n${var.openblack_pr_token}"),
     length(terraform_data.orig_upload) > 0 ? terraform_data.orig_upload[0].id : "no-archive",
   ]
 
@@ -184,10 +184,6 @@ resource "terraform_data" "provision" {
     precondition {
       condition     = local.keys_ready
       error_message = "Refusing to provision: the Claude subscription token and the GitHub token must both be set."
-    }
-    precondition {
-      condition     = local.bw1_build_ready
-      error_message = "Refusing to provision: no credential for the private bw1-build repo (deploy key or TF_VAR_bw1_build_token)."
     }
   }
 
@@ -233,23 +229,18 @@ resource "terraform_data" "provision" {
     destination = "/etc/bw1-sandbox/github.env"
   }
 
-  # bw1-build credential for the host's clone of the game files. Separate files, never mixed into
-  # GH_TOKEN, never given to workers; setup-droplet.sh deletes them after the clone unless
-  # keep_bw1_build_key. Both are empty unless orig_source = "git".
+  # PR-only credential for openblack: its own file, read only by the publisher's gh wrapper for
+  # PRs and comments on harness PRs against upstream_repo; never given to git. Empty unless pr_target =
+  # "openblack" (it is still written then, so comments on earlier openblack PRs can be read if set).
   provisioner "file" {
-    content     = local.bw1_build_key
-    destination = "/etc/bw1-sandbox/bw1-build-deploy-key"
-  }
-
-  provisioner "file" {
-    content     = local.bw1_build_token != "" ? "BW1_BUILD_TOKEN=${local.bw1_build_token}\n" : ""
-    destination = "/etc/bw1-sandbox/bw1-build-token.env"
+    content     = trimspace(var.openblack_pr_token) != "" ? "GH_OPENBLACK_PR_TOKEN=${var.openblack_pr_token}\n" : ""
+    destination = "/etc/bw1-sandbox/github-openblack-pr.env"
   }
 
   provisioner "remote-exec" {
     inline = [
       "set -e",
-      "chmod 0600 /etc/bw1-sandbox/claude-token.env /etc/bw1-sandbox/github.env /etc/bw1-sandbox/bw1-build-deploy-key /etc/bw1-sandbox/bw1-build-token.env",
+      "chmod 0600 /etc/bw1-sandbox/claude-token.env /etc/bw1-sandbox/github.env /etc/bw1-sandbox/github-openblack-pr.env",
       "rm -rf /opt/bw1-sandbox/droplet && mkdir -p /opt/bw1-sandbox/droplet",
       "unzip -q -o /opt/bw1-sandbox/droplet.zip -d /opt/bw1-sandbox/droplet && rm /opt/bw1-sandbox/droplet.zip",
       "find /opt/bw1-sandbox/droplet -type f -exec sed -i 's/\\r$//' {} +",

@@ -11,7 +11,14 @@ variable "claude_oauth_token" {
 }
 
 variable "github_token" {
-  description = "GitHub token for the publisher only (pushes branches and opens draft PRs on fork_repo). Never reaches the worker containers. Set TF_VAR_github_token; never put it in a file."
+  description = "Fork credential (tokens file key \"github\"): fine-grained PAT on fork_repo only, Contents read/write (pushes) and Pull requests read/write (PRs on the fork). Publisher only; never reaches the worker containers. Set TF_VAR_github_token; never put it in a file."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "openblack_pr_token" {
+  description = "PR-only credential for upstream_repo (tokens file key \"github_openblack_pr\"): fine-grained PAT, resource owner openblack, only bw1-decomp, Pull requests read/write, NO Contents permission. Publisher only, used only for gh pr create/list/view against upstream_repo, never by git. Needed only when pr_target = \"openblack\". Set TF_VAR_openblack_pr_token."
   type        = string
   default     = ""
   sensitive   = true
@@ -149,12 +156,12 @@ variable "claude_code_version" {
 # --- original game files ----------------------------------------------------------------------
 
 variable "orig_source" {
-  description = "\"archive\" (default): upload orig_archive_path (your bw1-original.zip, or a .tar.gz from scripts/pack-orig.ps1) and unpack it on the droplet host. \"git\": shallow clone of the private bw1-build repo on the host, LFS for game_version only (needs a deploy key or token). \"manual\": copy orig/ to the droplet yourself and re-run the setup."
+  description = "\"archive\" (default): upload orig_archive_path (your bw1-original.zip, or a .tar.gz from scripts/pack-orig.ps1) and unpack it on the droplet host. \"manual\": copy orig/ to the droplet yourself and re-run the setup."
   type        = string
   default     = "archive"
   validation {
-    condition     = contains(["git", "archive", "manual"], var.orig_source)
-    error_message = "git, archive or manual."
+    condition     = contains(["archive", "manual"], var.orig_source)
+    error_message = "archive or manual."
   }
 }
 
@@ -166,37 +173,6 @@ variable "game_version" {
     condition     = contains(["BW1W100", "BW1W110", "BW1W120"], var.game_version)
     error_message = "BW1W100, BW1W110 or BW1W120 (the versions the sandbox README maps to a compiler)."
   }
-}
-
-variable "bw1_build_repo" {
-  description = "Private repository holding orig/ (orig_source = \"git\")."
-  type        = string
-  default     = "openblack/bw1-build"
-}
-
-variable "bw1_build_ref" {
-  description = "Branch of bw1_build_repo to clone."
-  type        = string
-  default     = "main"
-}
-
-variable "bw1_build_key_path" {
-  description = "Private half of a READ-ONLY deploy key on bw1_build_repo (option a, recommended; scripts/new-bw1-build-key.ps1 makes it). Empty: keys/bw1-build-deploy in this project. Used only when it exists; otherwise bw1_build_token is used."
-  type        = string
-  default     = ""
-}
-
-variable "bw1_build_token" {
-  description = "Option b: a token with Contents: read on bw1_build_repo only (tokens file key \"github_bw1_build\"). Set TF_VAR_bw1_build_token; never put it in a file. Kept apart from github_token."
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "keep_bw1_build_key" {
-  description = "Keep the bw1-build credential on the droplet after a successful clone (needed to pull newer game files later). false: it is deleted once orig/ is verified."
-  type        = bool
-  default     = false
 }
 
 variable "orig_archive_path" {
@@ -218,6 +194,16 @@ variable "fork_repo" {
   validation {
     condition     = can(regex("^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$", var.fork_repo)) && !startswith(lower(var.fork_repo), "openblack/")
     error_message = "owner/name of your own fork; openblack/* is refused."
+  }
+}
+
+variable "pr_target" {
+  description = "Where the publisher opens draft PRs: \"fork\" (fork_repo, head = branch) or \"openblack\" (upstream_repo, head = <fork owner>:<branch>). Branches are always pushed to fork_repo only."
+  type        = string
+  default     = "fork"
+  validation {
+    condition     = contains(["fork", "openblack"], var.pr_target)
+    error_message = "fork or openblack."
   }
 }
 
@@ -244,13 +230,13 @@ variable "branch_prefix" {
 }
 
 variable "max_prs_per_day" {
-  description = "Draft PRs the publisher opens per UTC day."
+  description = "Draft PRs the publisher opens per UTC day, per PR target."
   type        = number
   default     = 3
 }
 
 variable "max_open_prs" {
-  description = "The publisher waits while this many of its PRs are open."
+  description = "The publisher waits while this many of its PRs are open on the current PR target."
   type        = number
   default     = 5
 }
@@ -271,4 +257,18 @@ variable "do_project_id" {
     condition     = can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.do_project_id))
     error_message = "A DigitalOcean project ID (UUID), e.g. 0a017c67-5e46-4f17-9a26-d8f40de0ae7b."
   }
+}
+
+# --- reviewer feedback (optional) ---------------------------------------------------------------
+
+variable "feedback_to_sandbox" {
+  description = "Off by default. true: new comments on a harness PR from feedback_authors become a follow-up prompt that resumes the worker which made the PR (bw1-sandbox-feedback.timer)."
+  type        = bool
+  default     = false
+}
+
+variable "feedback_authors" {
+  description = "GitHub logins whose PR comments may be fed back to workers. Empty: the fork's owner only. Comments from anyone else are stored but never reach a worker."
+  type        = list(string)
+  default     = []
 }

@@ -26,12 +26,12 @@ output "portal_tunnel" {
 
 output "stop_command" {
   description = "Kill switch: stop the publisher, autoresume and every worker."
-  value       = "ssh root@${digitalocean_droplet.sandbox.ipv4_address} 'touch /etc/bw1-sandbox/STOP && systemctl disable --now bw1-publisher.timer bw1-sandbox-autoresume.service bw1-sandbox-portal.service && docker ps -q --filter name=^w- | xargs -r docker stop'"
+  value       = "ssh root@${digitalocean_droplet.sandbox.ipv4_address} 'touch /etc/bw1-sandbox/STOP && systemctl disable --now bw1-publisher.timer bw1-publisher-comments.timer bw1-sandbox-feedback.timer bw1-sandbox-autoresume.service bw1-sandbox-portal.service && docker ps -q --filter name=^w- | xargs -r docker stop'"
 }
 
 output "pull_requests" {
   description = "Where the PRs appear."
-  value       = "https://github.com/${var.fork_repo}/pulls?q=is%3Apr+head%3A${trimsuffix(var.branch_prefix, "/")}"
+  value       = "https://github.com/${local.pr_repo}/pulls?q=is%3Apr+is%3Adraft+author%3A%40me"
 }
 
 output "do_project" {

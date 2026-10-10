@@ -3,14 +3,15 @@
 This runs [bwrsandman/bw1-ai-sandbox](https://github.com/bwrsandman/bw1-ai-sandbox), the maintainer's harness for
 [openblack/bw1-decomp](https://github.com/openblack/bw1-decomp), on a DigitalOcean droplet. The harness runs several
 `claude -p --dangerously-skip-permissions` matching workers, each in a hardened Docker container. A host-side
-**publisher** turns finished workers into **draft PRs on your fork** (`raffclar/bw1-decomp`), and never anywhere
-else. Terraform builds the droplet and assigns it to the existing DigitalOcean project "for bw1-decomp".
+**publisher** pushes finished workers as new branches to **your fork only** (`raffclar/bw1-decomp`). It opens
+**draft PRs** on the fork, or, with `pr_target = "openblack"`, on `openblack/bw1-decomp` from those branches.
+It also follows the comments on them. Terraform builds the droplet and assigns it to the existing DigitalOcean project "for bw1-decomp".
 
 **Nothing here is switched on.** You switch it on with `terraform/deploy.ps1`, which refuses to run without all of:
 
 * a DigitalOcean token;
 * your Claude subscription token, from `claude setup-token`;
-* a GitHub token for the publisher;
+* a GitHub token for the fork, plus a PR-only token for openblack if `pr_target = "openblack"`;
 * the game files: by default your zip, `E:/bw1-original.zip`, which must exist.
 
 No worker starts by itself. You start them yourself with the orchestrator, the portal or the CLI.
@@ -45,7 +46,7 @@ your PC                                  droplet (Ubuntu 24.04, project "for bw1
 deploy.ps1 ── SSH ──────────────────►    root: provisioning, bw1-egress (iptables), unpacking the game files
   tokens file -> env only                decomp (uid 1000, docker, sudo)   = the sandbox VM's user, ssh from 127.0.0.1 only
                                          sandbox  runs sandbox.py / portal / autoresume / orchestrator; Claude token
-                                         publisher                        GitHub token; pushes + opens draft PRs
+                                         publisher                        GitHub tokens; pushes (fork only), draft PRs, comments
                                          docker0: worker containers w-<name> (uid 2000, cap-drop ALL, no-new-privileges,
                                                   read-only rootfs, private /tmp, mirror and shared/ read-only)
 ```
@@ -72,11 +73,11 @@ deploy.ps1 ── SSH ──────────────────► 
 
 | | bw1-ai-sandbox (VM) | this droplet |
 |---|---|---|
-| isolation boundary | KVM guest: workers share the **VM's** kernel | containers share the **droplet's** kernel with the host, the publisher (GitHub token), the bw1-build clone (game files) and the Claude token |
+| isolation boundary | KVM guest: workers share the **VM's** kernel | containers share the **droplet's** kernel with the host, the publisher (GitHub tokens), the game files and the Claude token |
 | escape surface | KVM | container escape (kernel, Docker, runc) gives the whole droplet |
 | network filter | libvirt nwfilter, enforced by the host outside the VM | iptables on the same kernel; root on the droplet can change it. Workers have no root and no capabilities, but a container escape would bypass it |
 | host files | unreachable, no shares | not mounted into workers; reachable only after an escape |
-| GitHub credentials | on your PC only; nothing pushes | on the droplet: `GH_TOKEN` for the publisher (0600 `publisher`), and the bw1-build credential during the clone (root, deleted afterwards by default). Never in containers |
+| GitHub credentials | on your PC only; nothing pushes | on the droplet, publisher only (0600): the fork token and, with `pr_target = "openblack"`, the openblack PR-only token. Never in containers |
 | Claude OAuth token | in every worker's env (as upstream) | the same |
 | what limits damage | the VM, then your PC | **the droplet is disposable**: nothing else on it, a fine-grained token scoped to your fork, draft PRs only, `terraform destroy` |
 
@@ -112,7 +113,7 @@ repo's `.mcp.json`. Python dependencies come from a venv (Ubuntu's `python3-libv
 
 The copyrighted files are never committed here, and nothing downloads them. They go to the droplet **host** only.
 The sandbox's `sync` copies them to `/srv/decomp/shared/data`, which workers mount **read-only**, as upstream.
-Three sources (`orig_source`):
+Two sources (`orig_source`):
 
 * **`archive` (default): your zip.** `orig_archive_path` defaults to `E:/bw1-original.zip`.
   * `deploy.ps1` checks that the file exists and prints its size, without opening it.
@@ -126,21 +127,6 @@ Three sources (`orig_source`):
   * The uploaded archive is deleted after a successful unpack and check.
 
   A `.tar.gz` from `scripts/pack-orig.ps1` works the same way.
-* **`git`: the private `openblack/bw1-build` repo.** It is an alternative, no longer the default. On the host, root makes
-  a shallow clone into `/var/lib/bw1-build` (0700) with LFS skipped. It then runs `git lfs pull --include
-  "orig/<game_version>/**,orig/libs/**,orig/directx7.0/**"`, so only the version in use is fetched. The files are
-  copied into the sandbox's clone, checked for leftover LFS pointers and verified the same way. The credential needs
-  one of these:
-  * **(a) recommended: a read-only deploy key.** Run `scripts/new-bw1-build-key.ps1`. It writes
-    `keys/bw1-build-deploy` (gitignored) and prints the public key and
-    `https://github.com/openblack/bw1-build/settings/keys/new`. Leave "Allow write access" unchecked. Adding one
-    needs admin rights on bw1-build. The key goes to the droplet only (root, 0600), GitHub's host key is pinned, and
-    the key is deleted after a verified clone unless `keep_bw1_build_key = true`.
-  * **(b) a token.** Put `"github_bw1_build"` in the tokens file, with Contents: read on `openblack/bw1-build` only.
-    A fine-grained PAT covers one owner, so your raffclar token can't read openblack's repo. deploy.ps1 refuses
-    the token if it equals `"github"`.
-
-  Either credential is kept apart from `GH_TOKEN` and never reaches the sandbox user or a worker.
 * **`manual`:** copy the files to `/opt/bw1-sandbox/bw1-ai-sandbox/bw1-decomp/orig/` and re-run the setup.
 
 **What your zip covers.** From the list of names in it:
@@ -157,26 +143,111 @@ Three sources (`orig_source`):
 The game files never leave the droplet host and the workers' read-only mount. The publisher refuses any worker branch
 that touches `orig/` or `.gitattributes`, or that adds a Git LFS pointer. Its pre-push hook checks the same again.
 
+## Remotes and credentials
+
+| remote | role | credential (tokens file key) | where it is stored |
+|---|---|---|---|
+| `raffclar/bw1-decomp` (`fork_repo`) | the **only** push target: new `ai-sandbox/*` branches. Draft PRs and comments there when `pr_target = "fork"` | `github`: fine-grained PAT, resource owner raffclar, only this repo | droplet `/etc/bw1-sandbox/github.env`, 0600 `publisher`; git's credential helper for the push, gh for PRs |
+| `openblack/bw1-decomp` (`upstream_repo`) | fetch (anonymous). With `pr_target = "openblack"`: draft PRs with head `raffclar:ai-sandbox/*`, and comments on them. **Never a push, update or delete** | `github_openblack_pr`: fine-grained PAT, resource owner openblack, only this repo, **no Contents write** | droplet `/etc/bw1-sandbox/github-openblack-pr.env`, 0600 `publisher`; used only by the publisher's gh wrapper, never by git |
+
+`scripts/new-github-credentials.ps1` prints these steps (page, owner, repository, permissions, key). It can also
+write a placeholder tokens template with `-OutFile` (`-WhatIf` supported). It generates nothing secret: GitHub tokens
+are only made on github.com.
+
+### Permissions (fine-grained tokens; everything not listed: No access)
+
+| permission | `github` (raffclar/bw1-decomp) | `github_openblack_pr` (openblack/bw1-decomp) | needed for |
+|---|---|---|---|
+| Metadata | Read | Read | mandatory for every fine-grained token |
+| Contents | **Read and write** | **Read** | fork: pushing branches. openblack: PR files and commits. Not write: no push, merge or branch deletion |
+| Pull requests | Read and write | Read and write | create, list and view PRs; read and post PR conversation comments, review comments and reviews |
+| Commit statuses | Read | Read | CI state of PR heads (`comments`) |
+| Actions | Read | Read | workflow runs of PR heads (`comments`; openblack's Build workflow) |
+| Issues | No | No | not needed: the issue-comment endpoints on PRs also accept Pull requests |
+| Checks | (none) | (none) | the Checks API is not available to fine-grained PATs; CI is read through Commit statuses and Actions |
+| Workflows, Administration, Secrets, Variables, Environments, Webhooks, Deployments, Pages, Discussions, others | No | No | nothing uses them |
+
+Sources:
+
+* the [permissions for fine-grained tokens](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens):
+  * `POST /repos/{o}/{r}/pulls` needs Pull requests: write;
+  * `GET/POST /repos/{o}/{r}/issues/{n}/comments` is listed under **both** Issues and Pull requests;
+  * `POST /pulls/{n}/comments` and `/pulls/{n}/reviews` need Pull requests: write;
+  * `GET /commits/{ref}/status` needs Commit statuses: read;
+  * `GET /actions/runs` needs Actions: read;
+* the [token limitations](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
+
+### PR-only rights on openblack: what works
+
+* **A fine-grained PAT can do it, because raffclar is a member of openblack.** Checked read-only with
+  `gh api user/memberships/orgs/openblack`: role `member`. `repos/openblack/bw1-decomp` reports push access.
+  * Fine-grained tokens "cannot contribute to public repos where the user is not a member" or is only an outside
+    collaborator ([docs](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)).
+    As a member, a token whose resource owner is **openblack**, limited to `bw1-decomp`, works. With Pull requests:
+    write and Contents: read, it can open PRs and comment, but cannot push, merge (merging needs Contents: write)
+    or delete branches. Your account's write access does not widen the token.
+  * The org may require **approval** of fine-grained tokens. Until an owner approves it, the token "can only read
+    public resources", so the first `pr create` fails until then.
+  * GitHub's REST docs add that you "must have write access to the head" of a cross-repository PR. raffclar owns the
+    fork. Whether GitHub accepts an openblack-scoped token for a `raffclar:` head is **not verifiable offline**, so
+    the first openblack PR is the test.
+* **A classic PAT is not least privilege.** `public_repo` grants "read/write access to code … for public
+  repositories" ([scopes](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)). Since
+  raffclar can push to openblack, a classic token **could push there**. Use it only as a fallback, if the org forbids
+  fine-grained tokens or the head check above fails, and then only with `-AllowSameTokenForOpenblack` or a separate
+  classic token. In that case only our guards (below) keep it PR-only. A cleaner fallback is a GitHub App installed on
+  openblack by an owner, with Pull requests: write only.
+* **No token type gives "PRs but not push" on its own** except the fine-grained token with Contents: read, so the
+  publisher also enforces it in layers:
+  1. git pushes go only to the remote `fork`, and only if its push URL is exactly `https://github.com/raffclar/bw1-decomp.git`;
+  2. the pre-push hook refuses openblack URLs, refs outside `ai-sandbox/`, updates, deletions and game files;
+  3. the publisher clone's `origin` (openblack) has its push URL set to `DISABLED`;
+  4. every gh call goes through `GhGuard`. Only `pr create` (draft, harness head), `pr list`, `pr view`, `pr comment`
+     and `pr review --comment` on harness PRs, and `GET` on five read endpoints are allowed. Editing or deleting
+     comments, approving, closing, merging, ready, reopen, labels, issues, other repos, other gh commands, other HTTP
+     methods and `api` with fields are refused;
+  5. the openblack token is passed only to that wrapper's gh process, never to git.
+
+  `droplet/tests/test_publisher.py` tests each of these.
+
 ## Publisher
 
 On a timer (`publish_interval`, 30 min), as the `publisher` user:
 
 1. **Export.** `bw1-sandbox-export` runs first, as `sandbox`. It is the sandbox's own `fetch` for finished workers,
    and it writes their state, final result and `sandbox/<name>` head to `/var/lib/bw1-sandbox/export/workers.json`.
-2. **Pick.** It takes workers that are exited, not stopped on the usage limit, have new commits, and are not
-   already published or rejected.
+2. **Pick.** It takes workers that are exited, not stopped on the usage limit, have new commits, and are not already
+   published or rejected.
 3. **Fetch.** It fetches each one from the sandbox clone into its own bare clone. Only objects and refs come across,
    so worker code is **never built or run** on the host.
-4. **Refuse.** It rejects anything that touches `orig/`, `.gitattributes` or LFS pointers, or any change outside
-   `allowed_paths` (`src/*`, `include/*`, `tools/matching_ledger.jsonl`). It also rejects changes over 40 files
-   or 4000 lines.
-5. **Push.** It pushes the worker's commits unchanged as a **new** branch, `ai-sandbox/<date>-<name>-<sha7>`, to
-   `fork_repo` only. The pre-push hook refuses openblack URLs, any ref outside `ai-sandbox/`, updates (so force
-   pushes), deletions and game files.
-6. **Open a draft PR.** It opens one on `fork_repo`, base `main`, with the commits, files, the worker's final summary
-   and a "not verified" note.
-7. **Limits.** At most `max_prs_per_day` (3) per day. It waits while `max_open_prs` (5) are open. It refuses a
-   `FORK_REPO` or `PR_REPO` that is `openblack/*`, or a `PR_REPO` that differs from `FORK_REPO`.
+4. **Refuse.** It rejects anything that touches `orig/`, `.gitattributes` or LFS pointers, any change outside
+   `allowed_paths`, and changes over 40 files or 4000 lines.
+5. **Push.** It pushes the commits unchanged as a **new** branch, `ai-sandbox/<date>-<name>-<sha7>`, to
+   `raffclar/bw1-decomp` only.
+6. **Open a draft PR** on the PR target, base `main`:
+   * `pr_target = "fork"`: on `raffclar/bw1-decomp`, head `<branch>`;
+   * `pr_target = "openblack"`: on `openblack/bw1-decomp`, head `raffclar:<branch>`.
+7. **Limits, per target.** `max_prs_per_day` (3) per day; it waits while `max_open_prs` (5) harness PRs are open on
+   the target.
+
+**Comments** (`bw1-publisher-comments.timer`, every 15 min; or `publisher.py comments`):
+
+* It covers the open harness PRs on both targets (head `ai-sandbox/*` in raffclar), each with that target's token.
+* It fetches new conversation comments, review comments and reviews since the last check, plus the head's commit
+  status and Actions runs.
+* It appends them to `/var/lib/bw1-publisher/comments/comments.jsonl` and logs a summary. Each item is seen once.
+
+**Replying:** `publisher.py reply --target fork|openblack --pr N --body-file F [--review]` posts a new conversation
+comment, or a comment-only review, on that PR. It works only if the PR is a harness PR. It never edits or deletes
+anyone's comments.
+
+**Feeding reviews back to workers (off by default).** With `feedback_to_sandbox = true`:
+
+* new comments from `feedback_authors` (default: the fork owner only) are queued in `/var/lib/bw1-sandbox/feedback/<worker>.md`;
+* `bw1-sandbox-feedback.timer` resumes the worker that made the PR, with the sandbox's own `resume`, using them as
+  its follow-up prompt;
+* comments from anyone else are stored but never reach a worker. On public openblack PRs anyone can comment, so
+  widening `feedback_authors` lets strangers prompt your workers.
 
 ## Switching it on
 
@@ -187,7 +258,7 @@ On a timer (`publish_interval`, 30 min), as the `publisher` user:
      "digitalocean": "dop_v1_REPLACE_ME",
      "claude_oauth": "sk-ant-oat01-REPLACE_ME",
      "github": "github_pat_REPLACE_ME",
-     "github_bw1_build": "github_pat_REPLACE_ME_OPTIONAL"
+     "github_openblack_pr": "github_pat_REPLACE_ME_ONLY_FOR_PR_TARGET_OPENBLACK"
    }
    ```
 
@@ -196,12 +267,12 @@ On a timer (`publish_interval`, 30 min), as the `publisher` user:
      The sandbox runs workers on this token (`sandbox.py token` stores exactly `CLAUDE_CODE_OAUTH_TOKEN=<token>`).
      deploy.ps1 writes the same file, because `sandbox.py token` only reads it interactively (`getpass`).
      An `anthropic` API key is not used.
-   * `github`: a fine-grained PAT on `raffclar/bw1-decomp` with Contents and Pull requests read/write.
-   * `github_bw1_build`: only for `orig_source = "git"`, option (b) above.
+   * `github` and `github_openblack_pr`: see [Remotes and credentials](#remotes-and-credentials), or run
+     `scripts/new-github-credentials.ps1`. `github_openblack_pr` is required only with `pr_target = "openblack"`.
+     deploy.ps1 refuses it if it equals `github`, unless you pass `-AllowSameTokenForOpenblack`, and then it warns.
 2. **Fork.** `raffclar/bw1-decomp` must exist. Keep its `main` in step with upstream yourself; the publisher never
    touches `main`.
-3. **Game files.** By default `E:/bw1-original.zip` must exist; nothing else is needed. For `git`, run
-   `scripts/new-bw1-build-key.ps1` and add the key on GitHub, or use (b).
+3. **Game files.** By default `E:/bw1-original.zip` must exist; nothing else is needed.
 4. **`terraform/terraform.tfvars`.** Copy it from `terraform.tfvars.example`. Your current `terraform.tfvars` still
    has settings of the old harness (`pr_draft`, `git_author_*` …). Terraform only warns about them, but remove them.
 5. **Run:**
@@ -210,13 +281,14 @@ On a timer (`publish_interval`, 30 min), as the `publisher` user:
    powershell -ExecutionPolicy Bypass -File E:\bw1-decomp\terraform\deploy.ps1           # -PlanOnly to stop before apply
    ```
 
-   The script checks the secrets and the game files (the zip exists, or a bw1-build credential for `git`), refuses secrets in tfvars, and checks the Terraform
-   version. It then runs `init` and `plan -out`, and prints a summary: resources, the DO project, droplet, sandbox
-   commit, game files, workers, publisher and services. It applies only after you type `deploy`.
+   The script checks the secrets, and the openblack PR token when `pr_target = "openblack"`. It checks that the zip
+   exists and prints its size, refuses secrets in tfvars, and checks the Terraform version. It then runs `init` and
+   `plan -out`, and prints a summary: resources, the DO project, droplet, sandbox commit, game files, workers, both
+   remotes and their roles, publisher and services. It applies only after you type `deploy`.
 
    The secrets reach Terraform only as `DIGITALOCEAN_TOKEN`, `TF_VAR_claude_oauth_token`, `TF_VAR_github_token` and
-   `TF_VAR_bw1_build_token`. The saved plan holds them, so the script deletes it on exit. The state holds only a
-   hash. A deploy key is read from its file by Terraform and is never printed in the plan.
+   `TF_VAR_openblack_pr_token`. The saved plan holds them, so the script deletes it on exit. The state holds only a
+   hash.
 
 Provisioning installs everything, builds the host toolchain (sandbox README step 3), builds the worker image,
 applies and checks the worker firewall, `sync`s and runs `check`. It takes a while because of the first toolchain
@@ -257,9 +329,11 @@ bw1-sandbox logs farmer
 ssh root@<ip> tail -n 40 /var/log/bw1-sandbox-setup.log              # provisioning, orig hash check
 ssh root@<ip> sudo -iu sandbox bw1-sandbox check                      # firewall proven from a container
 ssh root@<ip> /usr/local/sbin/bw1-egress show                         # the rules
-ssh root@<ip> systemctl list-timers bw1-publisher.timer bw1-egress.timer
+ssh root@<ip> systemctl list-timers bw1-publisher.timer bw1-publisher-comments.timer bw1-egress.timer
 ssh root@<ip> tail -n 50 /var/log/bw1-publisher/publisher.log
 ssh root@<ip> sudo -u publisher python3 /opt/bw1-sandbox/droplet/publisher.py --config /etc/bw1-sandbox/publisher.env --dry-run
+ssh root@<ip> sudo -u publisher python3 /opt/bw1-sandbox/droplet/publisher.py --config /etc/bw1-sandbox/publisher.env --dry-run comments
+python3 droplet/tests/test_publisher.py -v                            # offline guard tests (any machine with git + bash)
 ```
 
 `terraform output` lists the commands, the DO project link and the PR list link.
@@ -270,8 +344,8 @@ ssh root@<ip> sudo -u publisher python3 /opt/bw1-sandbox/droplet/publisher.py --
 * **Pause workers:** `bw1-sandbox pause NAME`, or `stop NAME`.
 * **Stop everything:** `terraform output stop_command`. It creates the stop file, disables the timers, autoresume
   and the portal, and stops all worker containers.
-* **Revoke:** revoke the Claude token (claude.ai account settings), the GitHub token and the bw1-build deploy key or
-  token on GitHub.
+* **Revoke:** revoke the Claude token (claude.ai account settings) and both GitHub tokens
+  (https://github.com/settings/personal-access-tokens).
 * **Tear down:** `terraform\teardown.ps1`. It runs `terraform destroy` on the droplet, the firewall, the SSH key and
   the project assignment, after you type `destroy`. **The DigitalOcean project itself is left in place**, because
   Terraform only assigns to it (`do_project_id`) and never manages it. Pushed branches and PRs stay on GitHub.
@@ -295,18 +369,20 @@ Billing is hourly: destroy the droplet when idle.
    workers will be told to use tools that aren't there.
 2. **Libraries missing from your zip.** It has no CRT, AMaths or DirectX `lib/` files, so workers can compile and
    diff single objects but can't run a full `ninja` link with the final hash check. Should those files go into the
-   zip? Alternatively, use `orig_source = "git"` (bw1-build has `orig/libs` and `directx7.0`), which needs a
-   deploy key (admin on bw1-build) or a `github_bw1_build` token. Is it OK for the game files to sit on a droplet
-   at all? They stay on the host and in the workers' read-only mount.
+   zip? Is it OK for the game files to sit on a droplet at all? They stay on the host and in the workers' read-only
+   mount.
 3. **Threat model.** Do you accept containers on a shared kernel next to the publisher and its GitHub token,
    compared with the sandbox's VM?
-4. **Who spawns workers?** Nothing does automatically: the orchestrator (Remote Control), the portal, or you.
+4. **PR target.** Draft PRs go to the fork until you set `pr_target = "openblack"`. Do openblack's maintainers want
+   harness PRs directly? Should `feedback_to_sandbox` be on, and for which reviewers?
+5. **Who spawns workers?** Nothing does automatically: the orchestrator (Remote Control), the portal, or you.
    Do you want a scheduled spawner?
-5. **Size and limits.** `s-8vcpu-16gb` and about 3 workers, 3 PRs per day, 5 open. How much of your subscription's
+6. **Size and limits.** `s-8vcpu-16gb` and about 3 workers, 3 PRs per day, 5 open. How much of your subscription's
    limits can the workers use?
-6. **Not verified until the first apply:**
+7. **Not verified until the first apply:**
    * the sandbox's Docker-over-paramiko path against a local `decomp@127.0.0.1`;
    * `docker>=7` with the pinned sandbox;
    * the Ubuntu toolchain targets (`build/tools/wibo`, `llvm`, ICC);
-   * `git lfs pull` over a deploy key;
+   * that GitHub accepts the openblack-scoped token for a PR with head `raffclar:<branch>`, and whether openblack
+     requires approving it;
    * whether `claude --remote-control` combines with `--mcp-config` / `--strict-mcp-config`.

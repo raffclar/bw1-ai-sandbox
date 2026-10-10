@@ -1,0 +1,10 @@
+[Unit]
+Description=bw1 sandbox: check the harness's PRs for new comments periodically
+
+[Timer]
+OnActiveSec=20min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
