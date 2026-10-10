@@ -1,0 +1,40 @@
+# Terraform state, plans and local settings (state and plans can hold secrets)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+terraform/.build/
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+backend.tf
+
+# Keys and tokens
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*.env
+!config.env.example
+secrets.*
+api_tokens*.json
+*tokens*.json
+
+# Copyrighted original game files
+orig/
+orig-*.tar.gz
+*.tar.gz
+*.exe
+*.dll
+*.lib
+
+# Harness dry runs and Python caches
+harness/dry-run/
+__pycache__/

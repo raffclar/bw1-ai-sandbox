@@ -1,0 +1,14 @@
+#cloud-config
+# First boot only: base packages. Everything harness-specific is done by
+# harness/setup-droplet.sh, which Terraform runs over SSH once the keys are uploaded.
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - unzip
+  - python3
+  - python3-venv
+  - ninja-build
+  - unattended-upgrades
