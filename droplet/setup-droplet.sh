@@ -63,6 +63,20 @@ if ! command -v gh >/dev/null; then
 	apt-get install -y -q gh
 fi
 
+say "ssh: keys only"
+# SSH is open to any address, so only key logins are allowed and failed attempts are banned for a while.
+apt-get install -y -q fail2ban
+cat >/etc/ssh/sshd_config.d/10-bw1-keys-only.conf <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+PermitEmptyPasswords no
+MaxAuthTries 3
+EOF
+sshd -t
+systemctl reload ssh 2>/dev/null || systemctl reload sshd
+systemctl enable --now fail2ban
+
 say "docker"
 # No container-to-container traffic on docker0, no privilege gain by default, no IPv6.
 install -d /etc/docker

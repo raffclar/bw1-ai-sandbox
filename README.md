@@ -65,7 +65,7 @@ deploy.ps1 ── SSH ──────────────────► 
   `api.anthropic.com` through `--add-host`. They can't reach GitHub, the DigitalOcean metadata service, the
   droplet's sshd or portal, or each other (`icc: false`). The worker image build uses the host network. The timer
   re-applies the rules every 15 minutes. `bw1-sandbox check` proves them from a real worker-image container.
-* **Host egress.** The DigitalOcean cloud firewall allows inbound SSH from `ssh_allowed_cidrs` only. Outbound it
+* **Host egress.** The DigitalOcean cloud firewall allows inbound SSH from `ssh_allowed_cidrs` only (any address by default in your tfvars; the droplet allows key logins only and fail2ban bans repeated failures). Outbound it
   allows only TCP 443 and 80, DNS and NTP. The host needs those for GitHub, Ubuntu mirrors, the tool downloads
   and the Anthropic API.
 * **Publisher.** A timer runs `bw1-sandbox-export` as `sandbox`, which is the sandbox's own `fetch` for finished
