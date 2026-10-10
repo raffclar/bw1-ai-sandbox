@@ -131,8 +131,9 @@ if [[ "$REPO_SOURCE" == local ]]; then
 		[[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] ||
 			{ echo "ERROR: bad repo-head.txt" >&2; exit 2; }
 		chmod 0644 "$BUNDLE"
-		as sandbox git bundle verify -q "$BUNDLE"
+		# git bundle verify must run inside a repository, so make the clone first.
 		[[ -d "$CLONE/.git" ]] || as sandbox git init -q "$CLONE"
+		as sandbox git -C "$CLONE" bundle verify -q "$BUNDLE"
 		# Every branch and tag as-is, and the local clone's own remote-tracking refs under fork/.
 		as sandbox git -C "$CLONE" fetch -q --update-head-ok --force "$BUNDLE" \
 			'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*' 'refs/remotes/origin/*:refs/remotes/fork/*'
