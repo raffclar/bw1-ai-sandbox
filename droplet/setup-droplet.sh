@@ -13,7 +13,7 @@
 #
 # Environment (set by Terraform): SANDBOX_REPO SANDBOX_REF UPSTREAM_REPO BW1_DECOMP_REF FORK_REPO
 #   REPO_SOURCE ORIG_SOURCE GAME_VERSION FEEDBACK_TO_SANDBOX WORKER_CPUS WORKER_MEMORY PUBLISH_INTERVAL PUBLISHER_ENABLED AUTORESUME_ENABLED
-#   PORTAL_ENABLED ORCHESTRATOR_TOOLS CLAUDE_VERSION
+#   PORTAL_ENABLED ORCHESTRATOR_TOOLS CLAUDE_VERSION GHIDRA_ENABLED GHIDRA_MODE
 set -Eeuo pipefail
 
 : "${SANDBOX_REPO:=https://github.com/bwrsandman/bw1-ai-sandbox.git}"
@@ -21,7 +21,7 @@ set -Eeuo pipefail
 : "${UPSTREAM_REPO:=openblack/bw1-decomp}" "${BW1_DECOMP_REF:=main}" "${FORK_REPO:?}"
 : "${REPO_SOURCE:=local}" "${ORIG_SOURCE:=local}" "${GAME_VERSION:=BW1W120}" "${FEEDBACK_TO_SANDBOX:=false}" "${WORKER_CPUS:=2}" "${WORKER_MEMORY:=4g}" "${PUBLISH_INTERVAL:=30min}"
 : "${PUBLISHER_ENABLED:=true}" "${AUTORESUME_ENABLED:=true}" "${PORTAL_ENABLED:=false}"
-: "${ORCHESTRATOR_TOOLS:=true}" "${CLAUDE_VERSION:=stable}"
+: "${ORCHESTRATOR_TOOLS:=true}" "${CLAUDE_VERSION:=stable}" "${GHIDRA_ENABLED:=true}" "${GHIDRA_MODE:=rw}"
 
 case "$GAME_VERSION" in
 BW1W100 | BW1W110) MSVC=6.4 ;;
@@ -269,6 +269,10 @@ for f in github.env github-openblack-pr.env; do
 done
 chown root:root "$ETC/publisher.env" "$ETC/egress.conf"
 chmod 0644 "$ETC/publisher.env" "$ETC/egress.conf"
+
+# Headless Ghidra + GhidraMCP's HTTP API for the workers (sandbox README "Ghidra MCP"); before the firewall,
+# which reads its port, and before `sync`, which copies local/ (mcp.json + bridge) to workers.
+GHIDRA_ENABLED="$GHIDRA_ENABLED" GHIDRA_MODE="$GHIDRA_MODE" GAME_VERSION="$GAME_VERSION" bash "$DROPLET/setup-ghidra.sh"
 
 say "worker egress firewall"
 install -m 0755 "$DROPLET/bw1-egress.sh" /usr/local/sbin/bw1-egress

@@ -49,6 +49,7 @@ deploy.ps1 ── SSH ──────────────────► 
   tokens file -> env only                decomp (uid 1000, docker, sudo)   = the sandbox VM's user, ssh from 127.0.0.1 only
                                          sandbox  runs sandbox.py / portal / autoresume / orchestrator; Claude token
                                          publisher                        GitHub tokens; pushes (fork only), draft PRs, comments
+                                         bw1-ghidra headless Ghidra; GhidraMCP's HTTP API on the docker0 gateway :8080 only
                                          docker0: worker containers w-<name> (uid 2000, cap-drop ALL, no-new-privileges,
                                                   read-only rootfs, private /tmp, mirror and shared/ read-only)
 ```
@@ -63,8 +64,10 @@ deploy.ps1 ── SSH ──────────────────► 
   DROP). They replace the sandbox's libvirt nwfilter. Workers reach **only TCP 443 to the Anthropic API ranges**
   (`api_nets` plus the resolved `api.anthropic.com`). They have no DNS, as in the VM, because the sandbox adds
   `api.anthropic.com` through `--add-host`. They can't reach GitHub, the DigitalOcean metadata service, the
-  droplet's sshd or portal, or each other (`icc: false`). The worker image build uses the host network. The timer
-  re-applies the rules every 15 minutes. `bw1-sandbox check` proves them from a real worker-image container.
+  droplet's sshd or portal, or each other (`icc: false`). The one host port they may open is the
+  [Ghidra MCP](#ghidra-mcp) port, TCP 8080 on the docker0 gateway (`ghidra.host`), as upstream allows the host's
+  Ghidra port. The worker image build uses the host network. The timer re-applies the rules every 15 minutes.
+  `bw1-sandbox check` proves them from a real worker-image container.
 * **Host egress.** The DigitalOcean cloud firewall allows inbound SSH from `ssh_allowed_cidrs` only (any address by default in your tfvars; the droplet allows key logins only and fail2ban bans repeated failures). Outbound it
   allows only TCP 443 and 80, DNS and NTP. The host needs those for GitHub, Ubuntu mirrors, the tool downloads
   and the Anthropic API.
@@ -96,19 +99,21 @@ offered upstream or rebased onto a new `sandbox_ref`.
 | method | upstream (VM) | droplet |
 |---|---|---|
 | `vm_state`, `vm_ip` | libvirt domain, DHCP lease | `running` once provisioned, `127.0.0.1` |
-| `host_ip` | libvirt network address | docker0 gateway (only used for `ghidra.host`) |
+| `host_ip` | libvirt network address | docker0 gateway (only used for `ghidra.host`, where bw1-ghidra listens) |
 | `locked` | nwfilter attached | `sudo bw1-egress check` |
 | `setup_host` | enables libvirt sockets | no-op (provisioning) |
 | `create` | virt-install, cloud-init, image, lockdown | push_bin, image, lockdown |
 | `build_image` | refuses while locked; builds on the VM's network | builds with `network_mode=host` |
 | `lockdown` | defines and attaches the nwfilter | `sudo bw1-egress apply`, then `check` |
-| `check` | probes from inside the VM | probes from a throwaway worker-image container on docker0, including GitHub, the DO metadata service and host sshd |
-| `unlock`, `start`, `shutdown`, `destroy`, `ghidra_forward`, `_set_filter`, `_restart` | libvirt operations | refused, with a reason |
+| `check` | probes from inside the VM | probes from a throwaway worker-image container on docker0, including GitHub, the DO metadata service and host sshd; reports whether the Ghidra MCP port answers |
+| `unlock`, `start`, `shutdown`, `destroy`, `_set_filter`, `_restart` | libvirt operations | refused, with a reason |
+| `ghidra_forward` | forwards the libvirt bridge address to Ghidra on the host | refused: Ghidra already listens on the docker0 gateway |
 | `portal` | `--pants-down-mode` opens it to any host | wrapper refuses `--pants-down-mode` and any non-loopback `--host` |
 
 Configuration: `sandbox.droplet.toml` sets worker CPUs and memory and the game version, as the sandbox README
-describes for other versions. `mcp.droplet.json` points the orchestrator at the wrapper's MCP server instead of the
-repo's `.mcp.json`. Python dependencies come from a venv (Ubuntu's `python3-libvirt` plus pip `docker>=7`, `paramiko`,
+describes for other versions. The sandbox's `local/` folder, which upstream leaves to the user, gets the workers'
+Ghidra `mcp.json` and bridge (see [Ghidra MCP](#ghidra-mcp)); nothing else in the checkout is touched.
+`mcp.droplet.json` points the orchestrator at the wrapper's MCP server instead of the repo's `.mcp.json`. Python dependencies come from a venv (Ubuntu's `python3-libvirt` plus pip `docker>=7`, `paramiko`,
 `cryptography` and `mcp`). The libvirt bindings are only imported, never used.
 
 ## Your clone and the game files
@@ -348,8 +353,42 @@ bw1-sandbox logs farmer
   non-localhost hosts are refused.
 * **Autoresume** (`autoresume_enabled`) runs as a service. The portal is started with `--no-autoresume` so the two
   don't both resume workers.
-* **Ghidra MCP** is off: there is no Ghidra on the droplet, `local/` is empty, and `ghidra-forward` is refused. Workers
-  use objdiff output and the Mac symbols.
+* **Ghidra MCP:** see the next section.
+
+## Ghidra MCP
+
+Workers get Ghidra the way the sandbox README's "Ghidra MCP" section describes, except that Ghidra runs headless
+on the droplet instead of on your PC. Turn it off with `ghidra_enabled = false`.
+
+| piece | what it is |
+|---|---|
+| JDK | Eclipse Temurin 21.0.12.1+1 (Ghidra 12.1 needs JDK 21), `/opt/bw1-ghidra/jdk` |
+| Ghidra | NSA Ghidra 12.1.4 (`ghidra_12.1.4_PUBLIC_20260921.zip`), `/opt/bw1-ghidra/ghidra` |
+| HTTP API | `droplet/ghidra/GhidraMcpServer.java`: the request handlers of [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) 1.4's plugin, ported to a headless GhidraScript. Same endpoints, parameters and replies, so the stock bridge works unchanged |
+| bridge | `bridge_mcp_ghidra.py` from GhidraMCP 1.4 (commit `27f316f8`), in the sandbox's `local/` with `mcp.json` (server name `ghidra`, `http://ghidra.host:8080/`). `sync` copies them to `/opt/mcp` in workers |
+| bridge packages | the worker image's unpinned `pip install mcp` now gets mcp 2.x, where the bridge's `FastMCP` no longer exists. So `local/pylib` holds mcp 1.30.0, requests and their dependencies, hash-pinned in `droplet/ghidra/bridge-requirements.txt` (CPython 3.13 wheels, as in the image), and `mcp.json` puts it first on `PYTHONPATH`. The sandbox's Dockerfile is not changed |
+| symbols | `droplet/ghidra/ApplyBw1Symbols.java` labels every function and object from `config/<version>/symbols.txt` before auto-analysis, so the demangler turns them into classes and signatures and decompiles carry the project's names |
+
+Every download is pinned and SHA-256 checked by `droplet/setup-ghidra.sh`, which `setup-droplet.sh` calls.
+
+* **Services.** `bw1-ghidra-analyse.service` (oneshot, root copies the inputs, the analysis runs as `bw1-ghidra`)
+  imports `orig/<version>/runblack-decrypted.exe` from the host clone, applies `symbols.txt` and runs full
+  auto-analysis into `/var/lib/bw1-ghidra/projects`. `bw1-ghidra.service` (user `bw1-ghidra`, restart on failure,
+  systemd sandboxing, no internet: `IPAddressDeny=any`) then serves the project on `<docker0 gateway>:8080`.
+* **Firewall.** `bw1-egress` lets docker0 open TCP 8080 on the gateway address and nothing else on the host.
+  Its `BW1-GHIDRA-GUARD` chain drops 8080 from every interface but docker0 and loopback, and the DigitalOcean
+  cloud firewall refuses it as well. The port comes from `/etc/bw1-sandbox/ghidra.conf`. The unit's
+  `IPAddressAllow` also refuses the host's own connections from 172.17.0.1; from the host use
+  `curl --interface 127.0.0.1 http://172.17.0.1:8080/segments`.
+* **After `symbols.txt` changes** (a new deploy of your clone): provisioning re-analyses by itself when the
+  executable, `symbols.txt`, the symbols script or Ghidra changed. By hand: `bw1-ghidra-analyse` (only if
+  something changed) or `bw1-ghidra-analyse --force`. The new project is built next to the live one, which keeps
+  serving until it is done.
+* **Exposure.** As upstream warns, **agents can write to the Ghidra project** through the MCP rename, comment and
+  type tools. Here that project is the droplet's own, built from your clone and isolated from your PC's Ghidra.
+  It is shared by all workers. Edits are saved every 5 minutes and when the service stops, and a re-analysis starts
+  over without them. `ghidra_mode = "ro"` refuses those tools instead. The service also offers workers a new
+  surface on the host: a Java HTTP server, reachable from every container.
 
 ## Checking it works
 
@@ -357,11 +396,16 @@ bw1-sandbox logs farmer
 ssh root@<ip> tail -n 40 /var/log/bw1-sandbox-setup.log              # provisioning, orig hash check
 ssh root@<ip> sudo -iu sandbox bw1-sandbox check                      # firewall proven from a container
 ssh root@<ip> /usr/local/sbin/bw1-egress show                         # the rules
+ssh root@<ip> systemctl status bw1-ghidra bw1-ghidra-analyse          # Ghidra MCP (journalctl -u for logs)
+ssh root@<ip> docker run --rm --user 2000:2000 --cap-drop ALL --read-only --tmpfs /tmp --add-host ghidra.host:172.17.0.1 \
+  -v /srv/decomp/shared/mcp:/opt/mcp:ro -v /opt/bw1-sandbox/droplet/tests/ghidra_mcp_e2e.py:/e2e.py:ro \
+  --entrypoint python3 bw1-worker /e2e.py                             # Ghidra MCP end to end, as a worker
 ssh root@<ip> systemctl list-timers bw1-publisher.timer bw1-publisher-comments.timer bw1-egress.timer
 ssh root@<ip> tail -n 50 /var/log/bw1-publisher/publisher.log
 ssh root@<ip> sudo -u publisher python3 /opt/bw1-sandbox/droplet/publisher.py --config /etc/bw1-sandbox/publisher.env --dry-run
 ssh root@<ip> sudo -u publisher python3 /opt/bw1-sandbox/droplet/publisher.py --config /etc/bw1-sandbox/publisher.env --dry-run comments
 python3 droplet/tests/test_publisher.py -v                            # offline guard tests (any machine with git + bash)
+python3 droplet/tests/test_ghidra.py -v                               # offline Ghidra MCP checks (endpoints, pins, config)
 ```
 
 `terraform output` lists the commands, the DO project link and the PR list link.

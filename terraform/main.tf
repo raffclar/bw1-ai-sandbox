@@ -55,6 +55,8 @@ locals {
     "PORTAL_ENABLED=${var.portal_enabled}",
     "ORCHESTRATOR_TOOLS=${var.orchestrator_tools}",
     "CLAUDE_VERSION=${var.claude_code_version}",
+    "GHIDRA_ENABLED=${var.ghidra_enabled}",
+    "GHIDRA_MODE=${var.ghidra_mode}",
   ])
 }
 

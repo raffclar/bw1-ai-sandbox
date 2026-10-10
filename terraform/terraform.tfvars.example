@@ -40,6 +40,8 @@ orig_archive_path = "E:/bw1-original.zip"
 # portal_enabled     = false   # localhost only; use the SSH tunnel in `terraform output portal_tunnel`
 # orchestrator_tools = true
 # publisher_enabled  = true
+# ghidra_enabled     = true    # headless Ghidra + GhidraMCP for workers, docker0 gateway only
+# ghidra_mode        = "rw"    # "ro" refuses the MCP rename/comment/type tools
 
 # Publisher limits.
 # publish_interval = "30min"

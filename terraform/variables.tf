@@ -169,6 +169,22 @@ variable "orchestrator_tools" {
   default     = true
 }
 
+variable "ghidra_enabled" {
+  description = "Give workers Ghidra through MCP: a headless Ghidra on the droplet (bw1-ghidra.service) serving GhidraMCP 1.4's HTTP API on the docker0 gateway only, the executable analysed with symbols.txt names, and the pinned bridge in the sandbox's local/."
+  type        = bool
+  default     = true
+}
+
+variable "ghidra_mode" {
+  description = "rw: agents' renames, comments and types are kept in the droplet's Ghidra project (shared by all workers, saved every 5 min; a re-analysis starts over). ro: those tools are refused."
+  type        = string
+  default     = "rw"
+  validation {
+    condition     = contains(["rw", "ro"], var.ghidra_mode)
+    error_message = "rw or ro."
+  }
+}
+
 variable "claude_code_version" {
   description = "Claude Code version for the host's orchestrator (native installer): stable, latest or x.y.z. Workers get the version their image installs."
   type        = string

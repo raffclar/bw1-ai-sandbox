@@ -1,0 +1,34 @@
+[Unit]
+Description=Headless Ghidra serving GhidraMCP's HTTP API to worker containers (docker0 gateway only)
+Documentation=file:///opt/bw1-sandbox/droplet/setup-ghidra.sh
+After=docker.service network-online.target
+Wants=docker.service
+ConditionPathExists=/var/lib/bw1-ghidra/projects/live
+
+[Service]
+User=bw1-ghidra
+Group=bw1-ghidra
+ExecStart=/opt/bw1-ghidra/bin/bw1-ghidra-serve
+# SIGTERM ends GhidraMcpServer.java, after which analyzeHeadless saves (read-write mode) and exits.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=10
+Nice=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/bw1-ghidra
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
+# Ghidra needs no network beyond answering workers: no internet, nothing but docker0 and loopback.
+IPAddressDeny=any
+IPAddressAllow=localhost 172.16.0.0/12
+MemoryMax=5G
+
+[Install]
+WantedBy=multi-user.target

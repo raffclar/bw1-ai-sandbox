@@ -26,9 +26,10 @@ Every change, so it can be offered upstream or rebased (see also README "Changes
   lockdown        defines + attaches the nwfilter        sudo bw1-egress apply, then check
   unlock          detaches the nwfilter                  refused (edit the firewall by hand if needed)
   check           probes from inside the VM              probes from a throwaway worker-image container
+                                                         (and reports the Ghidra MCP port, when it is on)
   start/shutdown  libvirt domain start/stop              refused (the droplet is the VM)
   destroy         deletes the VM                         refused (terraform destroy / teardown.ps1)
-  ghidra_forward  forwards to host Ghidra                refused (Ghidra is off on the droplet)
+  ghidra_forward  forwards to host Ghidra                refused (Ghidra runs on the droplet: bw1-ghidra)
   portal          any --host with --pants-down-mode      localhost only; --pants-down-mode refused
 
 Usage (as the `sandbox` user, from anywhere):
@@ -51,6 +52,18 @@ SANDBOX_DIR = Path(os.environ.get("SANDBOX_DIR", "/opt/bw1-sandbox/bw1-ai-sandbo
 os.environ.setdefault("SANDBOX_CONFIG", str(SANDBOX_DIR / "sandbox.droplet.toml"))
 EGRESS = ["sudo", "-n", "/usr/local/sbin/bw1-egress"]
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
+GHIDRA_CONF = Path("/etc/bw1-sandbox/ghidra.conf")
+
+
+def ghidra_port():
+    """GHIDRA_PORT from setup-ghidra.sh's config, or None when the Ghidra MCP is off."""
+    try:
+        for line in GHIDRA_CONF.read_text().splitlines():
+            if line.startswith("GHIDRA_PORT=") and line[12:].strip().isdigit():
+                return int(line[12:].strip())
+    except OSError:
+        pass
+    return None
 
 # Probes run from a container on docker0, like `check` runs them from inside the VM upstream.
 PROBE_CODE = r"""
@@ -136,10 +149,12 @@ def patch(sb_mod) -> None:
             github = sb_mod.FALLBACK_GITHUB_IP
         gw = self.host_ip()
         leaks = sb_mod.LEAK_PROBES + [(github, 443), ("169.254.169.254", 80), (gw, 22)]
+        gport = ghidra_port()
+        extra = [(gw, gport)] if gport else []
         # Run detached and read the logs ourselves: docker-py's run() only returns output for the json-file and
         # journald log drivers, and the droplet's daemon uses "local".
         probe = self.docker.containers.run(
-            sb_mod.IMAGE, entrypoint=["python3", "-c", PROBE_CODE, json.dumps(leaks + [(api, 443)])],
+            sb_mod.IMAGE, entrypoint=["python3", "-c", PROBE_CODE, json.dumps(leaks + extra + [(api, 443)])],
             detach=True, user="2000:2000", cap_drop=["ALL"], security_opt=["no-new-privileges"], read_only=True,
             dns=["127.0.0.1"])
         try:
@@ -152,14 +167,20 @@ def patch(sb_mod) -> None:
             raise Err(f"the egress probe container failed (exit {status.get('StatusCode')}): {out.decode()[-800:]}")
         res = json.loads(lines[-1])
         api_key = f"{api}:443"
+        ghidra_key = f"{gw}:{gport}" if gport else None
+        ghidra_ok = res.pop(ghidra_key, False) if ghidra_key else None
         bad = [k for k, ok in res.items() if ok and k != api_key]
         if bad:
             raise Err(f"LEAK: a worker container reached {', '.join(bad)}")
         if not res.get(api_key):
             raise Err(f"a worker container cannot reach api.anthropic.com ({api})")
         blocked = ", ".join(k for k in res if k != api_key)
+        ghidra = ""
+        if ghidra_key:
+            ghidra = (f"; Ghidra MCP {ghidra_key} " +
+                      ("reachable" if ghidra_ok else "allowed but not answering (is bw1-ghidra.service up?)"))
         return (f"lockdown OK (droplet): {blocked} blocked from workers (github, DO metadata, host sshd included); "
-                f"api.anthropic.com ({api}) reachable")
+                f"api.anthropic.com ({api}) reachable{ghidra}")
 
     def refuse(what: str):
         def method(self, *a, **k):
@@ -171,7 +192,8 @@ def patch(sb_mod) -> None:
         "start": "the droplet is the VM; it is always on",
         "shutdown": "the droplet is the VM; stop the services or tear the droplet down",
         "destroy": "use terraform destroy (teardown.ps1)",
-        "ghidra_forward": "there is no Ghidra on the droplet",
+        "ghidra_forward": "Ghidra runs headless on the droplet itself (bw1-ghidra.service on the docker0 "
+                          "gateway), so there is nothing to forward",
         "_set_filter": "there is no libvirt network filter",
         "_restart": "there is no VM to restart",
     }

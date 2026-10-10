@@ -1,0 +1,10 @@
+[Unit]
+Description=Import runblack-decrypted.exe, apply symbols.txt and auto-analyse it for the workers' Ghidra MCP
+Documentation=file:///opt/bw1-sandbox/droplet/bw1-ghidra-analyse.sh
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root to copy the inputs out of the sandbox clone; the analysis itself runs as bw1-ghidra.
+ExecStart=/usr/local/sbin/bw1-ghidra-analyse
+TimeoutStartSec=6h
