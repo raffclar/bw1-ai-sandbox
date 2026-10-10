@@ -248,7 +248,7 @@ Destroy the droplet when you are not using it. Billing is hourly.
 3. **Game files.** Upload your own `orig/` (`archive`, the default)? Or get `read:packages` access to
    the private CI image (`ghcr`)? Note that `bw1-build` is private to the openblack organisation.
 4. **Size and region.** `s-8vcpu-16gb` in `lon1`, always on, or something smaller or larger?
-5. **Limits and model.** 3 PRs per day, 5 open, $5 per run, $25 per day, model `sonnet`, a run every
+5. **Limits and model.** 3 PRs per day, 5 open, $5 per run, $25 per day, model `claude-opus-5-5` (Opus 5.5), a run every
    2 h. Do these suit you?
 6. **Commit identity.** Which `git_author_name` / `git_author_email` should go on harness commits?
 7. **Not verified until the first run:**

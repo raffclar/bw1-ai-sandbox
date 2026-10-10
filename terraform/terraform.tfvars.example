@@ -24,7 +24,7 @@ orig_archive_path = "E:/bw1-decomp/orig-BW1W120.tar.gz"
 # ssh_private_key_path = "~/.ssh/id_ed25519"
 
 # Agent and limits.
-# claude_model     = "sonnet"
+# claude_model     = "claude-opus-5-5"
 # max_turns        = 150
 # max_usd_per_run  = 5
 # max_usd_per_day  = 25

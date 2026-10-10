@@ -169,7 +169,7 @@ variable "claude_code_version" {
 variable "claude_model" {
   description = "Model alias or ID passed to claude --model."
   type        = string
-  default     = "sonnet"
+  default     = "claude-opus-5-5"
 }
 
 variable "max_turns" {
