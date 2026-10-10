@@ -136,11 +136,21 @@ def patch(sb_mod) -> None:
             github = sb_mod.FALLBACK_GITHUB_IP
         gw = self.host_ip()
         leaks = sb_mod.LEAK_PROBES + [(github, 443), ("169.254.169.254", 80), (gw, 22)]
-        out = self.docker.containers.run(
+        # Run detached and read the logs ourselves: docker-py's run() only returns output for the json-file and
+        # journald log drivers, and the droplet's daemon uses "local".
+        probe = self.docker.containers.run(
             sb_mod.IMAGE, entrypoint=["python3", "-c", PROBE_CODE, json.dumps(leaks + [(api, 443)])],
-            remove=True, user="2000:2000", cap_drop=["ALL"], security_opt=["no-new-privileges"], read_only=True,
+            detach=True, user="2000:2000", cap_drop=["ALL"], security_opt=["no-new-privileges"], read_only=True,
             dns=["127.0.0.1"])
-        res = json.loads(out.decode().strip().splitlines()[-1])
+        try:
+            status = probe.wait(timeout=300)
+            out = probe.logs(stdout=True, stderr=False)
+        finally:
+            probe.remove(force=True)
+        lines = out.decode().strip().splitlines()
+        if status.get("StatusCode") != 0 or not lines:
+            raise Err(f"the egress probe container failed (exit {status.get('StatusCode')}): {out.decode()[-800:]}")
+        res = json.loads(lines[-1])
         api_key = f"{api}:443"
         bad = [k for k, ok in res.items() if ok and k != api_key]
         if bad:
