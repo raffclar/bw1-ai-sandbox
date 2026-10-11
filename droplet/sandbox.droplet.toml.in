@@ -83,5 +83,19 @@ for out in re.findall(r"^build (\S+): (?:download_tool|patch_headers)\s", ninja,
         lines.append(f"0\t0\t{os.stat(out).st_mtime_ns}\t{out}\t{ninja_hash(command):x}")
 with open(log, "a") as f:
     f.write("".join(line + "\n" for line in lines))
+# The project formats with clang-format 22 (AGENTS.md, CI); the image's Debian package is older and formats some
+# expressions differently. Provisioning installs 22 into the shared toolchain, and Claude Code's settings put it first
+# on PATH for the worker's shells.
+import json
+formatter = "/work/build/tools/clang-format22/bin"
+if os.path.exists(os.path.join(formatter, "clang-format")):
+    settings_path = pathlib.Path.home() / ".claude" / "settings.json"
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    env = settings.setdefault("env", {})
+    path = env.get("PATH", os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
+    if not path.startswith(formatter + ":"):
+        env["PATH"] = formatter + ":" + path
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings, indent=2))
 ''']
 packages = ["ninja-build", "clang-format", "llvm", "python3-pefile", "python3-yaml"]

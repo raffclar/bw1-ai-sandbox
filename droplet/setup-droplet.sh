@@ -224,6 +224,14 @@ done
 if as sandbox bash -c "cd '$CLONE' && ninja -t query pre-compile" >/dev/null 2>&1; then
 	as sandbox bash -c "cd '$CLONE' && ninja pre-compile"
 fi
+# clang-format 22, which the project formats with (AGENTS.md, CI): the worker image's Debian package is older. Installed
+# into the toolchain so `sync` hands it to workers; their setup puts build/tools/clang-format22/bin first on PATH.
+CF="$CLONE/build/tools/clang-format22"
+as sandbox "$VENV/bin/python3" -m pip install -q --upgrade --target "$CF" "clang-format>=22,<23"
+CF_BIN=$(find "$CF" -path "*data/bin/clang-format" -type f | head -1)
+[[ -n "$CF_BIN" ]] || { echo "ERROR: clang-format 22 binary not found under $CF" >&2; exit 3; }
+as sandbox mkdir -p "$CF/bin"
+as sandbox ln -sfn "../${CF_BIN#"$CF"/}" "$CF/bin/clang-format"
 
 # bw1-decomp's Getting Started: libircmt.lib can be copied out of the downloaded ICC compiler.
 ICC_LIB="$CLONE/build/compilers/ICC/5.0.1/lib/libircmt.lib"
