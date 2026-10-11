@@ -217,6 +217,43 @@ class RepoTests(unittest.TestCase):
         self.assertTrue(all(c["token"] == "openblack-token-dummy" for c in calls if UP in c["args"]))
         self.assertEqual(git("-C", str(self.t / "P.git"), "ls-remote", "--heads", ".", "ai-sandbox/*"), "")
 
+    def add_worker(self, name, changes):
+        t = self.t
+        git("-C", str(t / "C"), "checkout", "-q", "-B", f"w-{name}", "origin/main")
+        for path, content in changes.items():
+            (t / "C" / path).parent.mkdir(parents=True, exist_ok=True)
+            (t / "C" / path).write_text(content)
+        git("-C", str(t / "C"), "add", "-A")
+        git("-C", str(t / "C"), "commit", "-qm", f"{name}: change {', '.join(changes)}")
+        git("-C", str(t / "C"), "update-ref", f"refs/remotes/sandbox/{name}", "HEAD")
+        head = git("-C", str(t / "C"), "rev-parse", "HEAD")
+        export = json.loads((t / "workers.json").read_text())
+        export["workers"].append({"name": name, "state": "exited", "limited": None, "model": "opus", "head": head,
+                                  "commits": 1, "ref": f"refs/remotes/sandbox/{name}",
+                                  "result": {"subtype": "success", "text": f"{name} done", "turns": 9}})
+        (t / "workers.json").write_text(json.dumps(export))
+        return head
+
+    def test_code_and_data_go_out_as_two_prs(self):
+        head = self.add_worker("mixed", {"src/a.cpp": "int a = 2;\n", "config/BW1W120/symbols.txt": "a = 1;\n"})
+        self.add_worker("stray", {"src/a.cpp": "int a = 3;\n", "docs/notes.md": "x\n"})
+        pub = P.Publisher(self.cfg(), dry_run=True)
+        pub.guards()
+        pub.cmd_publish()
+        log = (self.t / "pub.log").read_text()
+        self.assertIn(f"-mixed-{head[:7]}-code", log)
+        self.assertIn(f"-mixed-{head[:7]}-data", log)
+        self.assertIn("skip stray: changes outside", log)
+        # Each part is one commit on upstream main holding only its own files
+        git("-C", str(self.t / "P.git"), "fetch", "-q", str(self.t / "C"), "+refs/remotes/sandbox/mixed:refs/incoming/mixed")
+        base = git("-C", str(self.t / "P.git"), "rev-parse", "refs/remotes/origin/main")
+        code = pub.part_commit(base, head, ["src/a.cpp"], "mixed", "code", ["abc mixed"])
+        data = pub.part_commit(base, head, ["config/BW1W120/symbols.txt"], "mixed", "data", ["abc mixed"])
+        names = lambda c: git("-C", str(self.t / "P.git"), "diff", "--name-only", base, c).split()
+        self.assertEqual(names(code), ["src/a.cpp"])
+        self.assertEqual(names(data), ["config/BW1W120/symbols.txt"])
+        self.assertEqual(git("-C", str(self.t / "P.git"), "rev-parse", f"{code}^"), base)
+
     def test_publish_refuses_push_to_openblack(self):
         git("-C", str(self.t / "P.git"), "remote", "set-url", "--push", "fork", f"https://github.com/{UP}.git")
         pub = P.Publisher(self.cfg(PR_TARGET="openblack", PR_REPO=UP), dry_run=False)

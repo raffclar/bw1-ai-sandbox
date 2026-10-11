@@ -65,6 +65,9 @@ DEFAULTS = {
     "MAX_CHANGED_FILES": "40",
     "MAX_CHANGED_LINES": "4000",
     "ALLOWED_PATHS": "src/*,include/*,tools/matching_ledger.jsonl",
+    # A worker branch that also changes these goes out as two draft PRs: the code (ALLOWED_PATHS) in one, these in
+    # another. Anything matching neither list is still refused.
+    "SPLIT_PATHS": "config/*,configure.py",
     "FEEDBACK_TO_SANDBOX": "false",
     "FEEDBACK_DIR": "/var/lib/bw1-sandbox/feedback",
     "FEEDBACK_AUTHORS": "",
@@ -365,22 +368,93 @@ class Publisher:
             self.log(f"REFUSED {name}: touches game files or LFS pointers: {game[:10]}")
             state.setdefault("rejected", {})[name] = {"head": head, "why": f"game files / LFS pointers: {game[:10]}"}
             return False
-        allowed = [p.strip() for p in self.cfg["ALLOWED_PATHS"].split(",") if p.strip()]
-        outside = [f for f in files if not any(fnmatch.fnmatch(f, p) for p in allowed)]
+        allowed = self.globs("ALLOWED_PATHS")
+        split = self.globs("SPLIT_PATHS")
+        code = [f for f in files if self.matches(f, allowed)]
+        data = [f for f in files if not self.matches(f, allowed) and self.matches(f, split)]
+        outside = [f for f in files if f not in code and f not in data]
         if outside:
-            self.log(f"skip {name}: changes outside {allowed}: {outside[:10]}")
+            self.log(f"skip {name}: changes outside {allowed + split}: {outside[:10]}")
             state.setdefault("rejected", {})[name] = {"head": head, "why": f"paths outside allowed: {outside[:10]}"}
             return False
-        if len(files) > int(self.cfg["MAX_CHANGED_FILES"]) or lines > int(self.cfg["MAX_CHANGED_LINES"]):
-            self.log(f"skip {name}: too large ({len(files)} files, {lines} lines)")
-            state.setdefault("rejected", {})[name] = {"head": head, "why": f"too large: {len(files)} files, {lines} lines"}
-            return False
+        if not data:
+            return self.publish_part(w, state, target, base, head, head, commits, files, lines, part=None)
 
-        branch = f"{self.cfg['BRANCH_PREFIX']}{self.today.replace('-', '')}-{name}-{head[:7]}"
+        # Code and data go out as two draft PRs, each one commit on upstream main holding only its own files
+        parts = [(kind, part_files) for kind, part_files in (("code", code), ("data", data)) if part_files]
+        for kind, part_files in parts:
+            part_lines = self.changed_lines(base, head, part_files)
+            if len(part_files) > int(self.cfg["MAX_CHANGED_FILES"]) or part_lines > int(self.cfg["MAX_CHANGED_LINES"]):
+                self.log(f"skip {name}: {kind} part too large ({len(part_files)} files, {part_lines} lines)")
+                state.setdefault("rejected", {})[name] = {
+                    "head": head, "why": f"{kind} part too large: {len(part_files)} files, {part_lines} lines"}
+                return False
+        published = []
+        for kind, part_files in parts:
+            commit = self.part_commit(base, head, part_files, name, kind, commits)
+            part = {"kind": kind, "of": [k for k, _ in parts], "urls": [p["url"] for p in published]}
+            entry = self.publish_part(w, state, target, base, head, commit, commits, part_files,
+                                      self.changed_lines(base, head, part_files), part=part)
+            if not entry:
+                return bool(published)
+            published.append(entry)
+        if not self.dry:
+            state.setdefault("published", {})[name] = {"head": head, "parts": published}
+        return True
+
+    def globs(self, key: str) -> list:
+        return [p.strip() for p in self.cfg.get(key, "").split(",") if p.strip()]
+
+    @staticmethod
+    def matches(path: str, globs) -> bool:
+        return any(fnmatch.fnmatch(path, g) for g in globs)
+
+    def changed_lines(self, base: str, head: str, files) -> int:
+        lines = 0
+        for row in self.git("diff", "--numstat", f"{base}..{head}", "--", *files).splitlines():
+            cols = row.split("\t")
+            if len(cols) >= 2 and cols[0].isdigit() and cols[1].isdigit():
+                lines += int(cols[0]) + int(cols[1])
+        return lines
+
+    def part_commit(self, base: str, head: str, files, name: str, kind: str, commits) -> str:
+        """One commit on base holding head's version of the given files only (added, changed or removed)."""
+        index = Path(self.cfg["STATE"]).parent / f"split-{name}-{kind}.index"
+        env = {"GIT_INDEX_FILE": str(index)}
+        try:
+            self.git("read-tree", base, env=env)
+            for f in files:
+                entry = self.git("ls-tree", head, "--", f)
+                if entry:
+                    mode, _, rest = entry.partition(" ")
+                    sha = rest.split()[1]
+                    self.git("update-index", "--add", "--cacheinfo", f"{mode},{sha},{f}", env=env)
+                else:
+                    self.git("update-index", "--force-remove", "--", f, env=env)
+            tree = self.git("write-tree", env=env)
+        finally:
+            index.unlink(missing_ok=True)
+        who = self.git("log", "-1", "--format=%an%x00%ae", head).split("\0")
+        what = "code (src, include)" if kind == "code" else "data (config, symbols, splits)"
+        message = "\n".join([f"{name}: {what}", "", f"The {what} changes of worker {name}'s branch "
+                             f"({head[:10]}), split out by the publisher. Its commits:", "",
+                             *[f"- {c}" for c in commits]])
+        author = {"GIT_AUTHOR_NAME": who[0], "GIT_AUTHOR_EMAIL": who[1] if len(who) > 1 else "",
+                  "GIT_COMMITTER_NAME": who[0], "GIT_COMMITTER_EMAIL": who[1] if len(who) > 1 else ""}
+        return self.git("commit-tree", tree, "-p", base, "-m", message, env=author)
+
+    def publish_part(self, w: dict, state: dict, target: str, base: str, head: str, commit: str, commits, files,
+                     lines: int, part):
+        name = w["name"]
+        suffix = f"-{part['kind']}" if part else ""
+        branch = f"{self.cfg['BRANCH_PREFIX']}{self.today.replace('-', '')}-{name}-{head[:7]}{suffix}"
         repo = self.target_repo(target)
         head_ref = f"{self.guard.fork_owner}:{branch}" if target == "openblack" else branch
         title = f"[ai-sandbox] {name}: {commits[-1].split(' ', 1)[-1][:80]}"
-        body = self.body(w, commits, base, head, files, lines)
+        if part:
+            title = f"[ai-sandbox] {name} ({part['kind']}): {commits[-1].split(' ', 1)[-1][:70]}"
+        body = self.body(w, commits, base, head, files, lines, part)
+        head = commit
         # Pushes: fork only, checked here and again by the pre-push hook.
         url = self.assert_push_url()
         if self.dry:
@@ -397,12 +471,14 @@ class Publisher:
                           "--draft", "--title", title, "--body-file", str(body_file)], write=True)
         if self.dry:
             print("----- PR body -----\n" + body + "\n-------------------", file=sys.stderr)
-            return True
+            return {"head": w["head"], "branch": branch, "url": "(dry run)", "repo": repo}
         self.log(f"published {name} {head[:10]} -> {branch}: {pr_url}")
-        state.setdefault("published", {})[name] = {"head": head, "branch": branch, "url": pr_url, "repo": repo}
-        return True
+        entry = {"head": w["head"], "branch": branch, "url": pr_url, "repo": repo}
+        if not part:
+            state.setdefault("published", {})[name] = entry
+        return entry
 
-    def body(self, w: dict, commits, base: str, head: str, files, lines: int) -> str:
+    def body(self, w: dict, commits, base: str, head: str, files, lines: int, part=None) -> str:
         result = w.get("result") or {}
         text = (result.get("text") or "").strip().replace("```", "'''")[:5000]
         out = [
@@ -414,6 +490,18 @@ class Publisher:
             f"- base: `{base[:10]}` (upstream main), head: `{head[:10]}` on `{self.cfg['FORK_REPO']}`",
             f"- {len(files)} file(s), {lines} changed lines",
             "",
+        ]
+        if part:
+            other = [k for k in part["of"] if k != part["kind"]]
+            out += [
+                f"**Split PR ({part['kind']}).** The worker's branch changed both code and data, so the publisher "
+                f"split it: this PR holds only its {part['kind']} files, as one commit on upstream main. The "
+                f"{', '.join(other)} part is a separate draft PR"
+                + (f" ({', '.join(part['urls'])})" if part["urls"] else "")
+                + ". The two belong together: review and merge them as a pair.",
+                "",
+            ]
+        out += [
             "### Commits",
             "",
             *[f"- {c}" for c in commits],
