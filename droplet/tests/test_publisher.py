@@ -254,6 +254,19 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(names(data), ["config/BW1W120/symbols.txt"])
         self.assertEqual(git("-C", str(self.t / "P.git"), "rev-parse", f"{code}^"), base)
 
+    def test_part_commits_are_by_the_configured_author_with_the_trailer(self):
+        head = self.add_worker("mixed", {"src/a.cpp": "int a = 2;\n", "config/BW1W120/symbols.txt": "a = 1;\n"})
+        pub = P.Publisher(self.cfg(COMMIT_AUTHOR_NAME="Someone", COMMIT_AUTHOR_EMAIL="someone@example.com"),
+                          dry_run=True)
+        pub.guards()
+        git("-C", str(self.t / "P.git"), "fetch", "-q", str(self.t / "C"), "+refs/remotes/sandbox/mixed:refs/incoming/mixed")
+        base = git("-C", str(self.t / "P.git"), "rev-parse", "refs/remotes/origin/main")
+        commit = pub.part_commit(base, head, ["src/a.cpp"], "mixed", "code", ["abc mixed"])
+        show = lambda f: git("-C", str(self.t / "P.git"), "log", "-1", f"--format={f}", commit)
+        self.assertEqual(show("%an <%ae>"), "Someone <someone@example.com>")
+        self.assertEqual(show("%cn <%ce>"), "Someone <someone@example.com>")
+        self.assertIn("Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", show("%B"))
+
     def test_publish_refuses_push_to_openblack(self):
         git("-C", str(self.t / "P.git"), "remote", "set-url", "--push", "fork", f"https://github.com/{UP}.git")
         pub = P.Publisher(self.cfg(PR_TARGET="openblack", PR_REPO=UP), dry_run=False)

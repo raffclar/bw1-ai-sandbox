@@ -68,6 +68,11 @@ DEFAULTS = {
     # A worker branch that also changes these goes out as two draft PRs: the code (ALLOWED_PATHS) in one, these in
     # another. Anything matching neither list is still refused.
     "SPLIT_PATHS": "config/*,configure.py",
+    # Who the published commits are by (the user) and the trailer crediting the AI. With no name or email set, the
+    # worker's own identity is kept.
+    "COMMIT_AUTHOR_NAME": "",
+    "COMMIT_AUTHOR_EMAIL": "",
+    "COMMIT_TRAILER": "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
     "FEEDBACK_TO_SANDBOX": "false",
     "FEEDBACK_DIR": "/var/lib/bw1-sandbox/feedback",
     "FEEDBACK_AUTHORS": "",
@@ -378,7 +383,9 @@ class Publisher:
             state.setdefault("rejected", {})[name] = {"head": head, "why": f"paths outside allowed: {outside[:10]}"}
             return False
         if not data:
-            return self.publish_part(w, state, target, base, head, head, commits, files, lines, part=None)
+            # One commit on upstream main, by the configured author, rather than the worker's own commits
+            commit = self.part_commit(base, head, files, name, "code", commits)
+            return self.publish_part(w, state, target, base, head, commit, commits, files, lines, part=None)
 
         # Code and data go out as two draft PRs, each one commit on upstream main holding only its own files
         parts = [(kind, part_files) for kind, part_files in (("code", code), ("data", data)) if part_files]
@@ -417,6 +424,14 @@ class Publisher:
                 lines += int(cols[0]) + int(cols[1])
         return lines
 
+    def commit_identity(self, head: str):
+        """The configured author (the user), else the identity of the worker's last commit."""
+        name, email = self.cfg.get("COMMIT_AUTHOR_NAME", ""), self.cfg.get("COMMIT_AUTHOR_EMAIL", "")
+        if name and email:
+            return name, email
+        who = self.git("log", "-1", "--format=%an%x00%ae", head).split("\0")
+        return who[0], who[1] if len(who) > 1 else ""
+
     def part_commit(self, base: str, head: str, files, name: str, kind: str, commits) -> str:
         """One commit on base holding head's version of the given files only (added, changed or removed)."""
         index = Path(self.cfg["STATE"]).parent / f"split-{name}-{kind}.index"
@@ -434,13 +449,15 @@ class Publisher:
             tree = self.git("write-tree", env=env)
         finally:
             index.unlink(missing_ok=True)
-        who = self.git("log", "-1", "--format=%an%x00%ae", head).split("\0")
+        who = self.commit_identity(head)
         what = "code (src, include)" if kind == "code" else "data (config, symbols, splits)"
-        message = "\n".join([f"{name}: {what}", "", f"The {what} changes of worker {name}'s branch "
-                             f"({head[:10]}), split out by the publisher. Its commits:", "",
-                             *[f"- {c}" for c in commits]])
-        author = {"GIT_AUTHOR_NAME": who[0], "GIT_AUTHOR_EMAIL": who[1] if len(who) > 1 else "",
-                  "GIT_COMMITTER_NAME": who[0], "GIT_COMMITTER_EMAIL": who[1] if len(who) > 1 else ""}
+        lines = [f"{name}: {what}", "", f"The {what} changes of worker {name}'s branch "
+                 f"({head[:10]}), split out by the publisher. Its commits:", "", *[f"- {c}" for c in commits]]
+        if self.cfg.get("COMMIT_TRAILER"):
+            lines += ["", self.cfg["COMMIT_TRAILER"]]
+        message = "\n".join(lines)
+        author = {"GIT_AUTHOR_NAME": who[0], "GIT_AUTHOR_EMAIL": who[1],
+                  "GIT_COMMITTER_NAME": who[0], "GIT_COMMITTER_EMAIL": who[1]}
         return self.git("commit-tree", tree, "-p", base, "-m", message, env=author)
 
     def publish_part(self, w: dict, state: dict, target: str, base: str, head: str, commit: str, commits, files,
