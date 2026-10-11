@@ -28,6 +28,8 @@ locals {
     "ALLOWED_PATHS=${join(",", var.allowed_paths)}",
     "FEEDBACK_TO_SANDBOX=${var.feedback_to_sandbox}",
     "FEEDBACK_AUTHORS=${join(",", var.feedback_authors)}",
+    "COMMIT_AUTHOR_NAME=${var.commit_author_name}",
+    "COMMIT_AUTHOR_EMAIL=${var.commit_author_email}",
     "",
   ])
 

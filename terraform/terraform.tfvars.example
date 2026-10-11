@@ -53,3 +53,8 @@ orig_archive_path = "E:/bw1-original.zip"
 # worker that made the PR (off by default; only comments from these logins, default the fork owner).
 # feedback_to_sandbox = false
 # feedback_authors    = ["raffclar"]
+
+# Who the published commits are by (you; use an email your GitHub account owns). Unset, they carry the worker's
+# "sandbox <name>" identity. Each commit also ends with a Co-Authored-By Claude trailer.
+# commit_author_name  = "your-github-name"
+# commit_author_email = "you@example.com"

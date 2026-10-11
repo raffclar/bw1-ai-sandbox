@@ -322,3 +322,15 @@ variable "feedback_authors" {
   type        = list(string)
   default     = []
 }
+
+variable "commit_author_name" {
+  description = "Author and committer name of the commits the publisher pushes (yours). Empty: the worker's own identity (\"sandbox <name>\") is kept. Every commit also ends with a Co-Authored-By Claude trailer."
+  type        = string
+  default     = ""
+}
+
+variable "commit_author_email" {
+  description = "Author and committer email of the commits the publisher pushes (one your GitHub account owns, so they are attributed to you). Empty: the worker's own identity is kept."
+  type        = string
+  default     = ""
+}
