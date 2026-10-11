@@ -81,6 +81,9 @@ NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
 LFS_MAGIC = b"version https://git-lfs"
+# The project never uses `extern` (AGENTS.md "Globals"): a worker branch adding one is refused
+EXTERN_RE = re.compile(r"\bextern\b")
+EXTERN_CHECKED = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".inl", ".inc")
 
 
 class Stop(Exception):
@@ -382,6 +385,11 @@ class Publisher:
             self.log(f"skip {name}: changes outside {allowed + split}: {outside[:10]}")
             state.setdefault("rejected", {})[name] = {"head": head, "why": f"paths outside allowed: {outside[:10]}"}
             return False
+        externs = self.added_externs(base, head, code)
+        if externs:
+            self.log(f"REFUSED {name}: adds `extern` (the project never uses it): {externs[:5]}")
+            state.setdefault("rejected", {})[name] = {"head": head, "why": f"adds extern: {externs[:5]}"}
+            return False
         if not data:
             # One commit on upstream main, by the configured author, rather than the worker's own commits
             commit = self.part_commit(base, head, files, name, "code", commits)
@@ -423,6 +431,22 @@ class Publisher:
             if len(cols) >= 2 and cols[0].isdigit() and cols[1].isdigit():
                 lines += int(cols[0]) + int(cols[1])
         return lines
+
+    def added_externs(self, base: str, head: str, files) -> list:
+        """`file: line` for every added C/C++ line using `extern` (AGENTS.md: never use extern; globals are static
+        members of their owning class). Comment lines don't count."""
+        sources = [f for f in files if f.endswith(EXTERN_CHECKED)]
+        if not sources:
+            return []
+        found, path = [], ""
+        for row in self.git("diff", "-U0", "--no-color", f"{base}..{head}", "--", *sources).splitlines():
+            if row.startswith("+++ "):
+                path = row[6:] if row.startswith("+++ b/") else row[4:]
+            elif row.startswith("+") and not row.startswith("+++"):
+                text = row[1:].strip()
+                if not text.startswith(("//", "/*", "*")) and EXTERN_RE.search(text.split("//")[0]):
+                    found.append(f"{path}: {text[:120]}")
+        return found
 
     def commit_identity(self, head: str):
         """The configured author (the user), else the identity of the worker's last commit."""

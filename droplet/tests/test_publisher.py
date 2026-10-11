@@ -254,6 +254,17 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(names(data), ["config/BW1W120/symbols.txt"])
         self.assertEqual(git("-C", str(self.t / "P.git"), "rev-parse", f"{code}^"), base)
 
+    def test_a_branch_adding_extern_is_refused(self):
+        self.add_worker("ext", {"src/a.cpp": "// extern in a comment is fine\nextern int g_counter;\n"})
+        self.add_worker("clean", {"src/b.cpp": "// no extern here, only in this comment\nint b = 1;\n"})
+        pub = P.Publisher(self.cfg(), dry_run=True)
+        pub.guards()
+        pub.cmd_publish()
+        log = (self.t / "pub.log").read_text()
+        self.assertIn("REFUSED ext: adds `extern`", log)
+        self.assertIn("src/a.cpp: extern int g_counter;", log)
+        self.assertNotIn("REFUSED clean", log)
+
     def test_part_commits_are_by_the_configured_author_with_the_trailer(self):
         head = self.add_worker("mixed", {"src/a.cpp": "int a = 2;\n", "config/BW1W120/symbols.txt": "a = 1;\n"})
         pub = P.Publisher(self.cfg(COMMIT_AUTHOR_NAME="Someone", COMMIT_AUTHOR_EMAIL="someone@example.com"),
