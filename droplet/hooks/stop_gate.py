@@ -4,7 +4,9 @@ committed branch and, if it has hard failures, block the stop ONCE so the worker
 
 Base: the first word of ~/case/gate-base when it exists (the hospital writes the case's upstream merge-base there),
 else the merge-base of origin/main and HEAD. ~/case/gate-allow, when it exists, names the revision whose protected
-paths are allowed (--allow-paths-from: the case's starting point).
+paths are allowed (--allow-paths-from: the case's starting point). While HEAD is still that starting point (a
+workup, or a treatment that has not committed yet) it never blocks: the case's inherited findings are the
+treatment's job, and blocking a workup only pushed the Fellow into writing a handoff (seen on pr431, 2026-10-12).
 
 Claude Code sets stop_hook_active when a stop hook already blocked this stop, so a worker that cannot fix the
 findings still ends (the Discharge Nurse and the publisher refuse the branch anyway).
@@ -43,8 +45,16 @@ def main() -> int:
                               text=True).stdout.strip()
     if not base:
         return 0
+    start = first_word(CASE / "gate-allow")
+    if start:
+        # A hospital case: findings the case started with are the treatment's job, not this run's. A workup (no
+        # commits allowed) or a run that has not committed yet ends normally.
+        head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        full = subprocess.run(["git", "-C", repo, "rev-parse", start], capture_output=True, text=True).stdout.strip()
+        if head and head == full:
+            return 0
     try:
-        findings = quality_gate.run(repo, base, "HEAD", allow_from=first_word(CASE / "gate-allow"))
+        findings = quality_gate.run(repo, base, "HEAD", allow_from=start)
     except quality_gate.GitError:
         return 0
     hard = [f for f in findings if f.level == "hard"]

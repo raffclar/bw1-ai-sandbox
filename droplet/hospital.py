@@ -705,6 +705,9 @@ class Hospital:
         if handoff:
             n = len(list(self.dir(cid).glob("handoff-*.md"))) + 1
             self.put(cid, f"handoff-{n}.md", handoff.decode(errors="replace"))
+            plan = self.ward.read(fellow, "home/case/plan.md") if stage == "workup" else None
+            if plan:  # the Chief needs the plan the handoff refers to
+                self.put(cid, f"plan-r{c['rounds'] + 1}-handoff.md", plan.decode(errors="replace"))
             return self.escalate(c, f"the Fellow wrote an I-PASS handoff (handoff-{n}.md)")
         if stage == "workup":
             plan = self.ward.read(fellow, "home/case/plan.md")

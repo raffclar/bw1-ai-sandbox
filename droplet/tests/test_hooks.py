@@ -225,6 +225,12 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(out["decision"], "block")
         self.assertIn("field-name", out["reason"])
         self.assertEqual(run(True).stdout, "")  # never blocks twice
+        # a hospital case still at its starting point (a workup): inherited findings never block
+        (self.home / "case/gate-allow").write_text(git(self.repo, "rev-parse", "HEAD").stdout.strip() + "\n")
+        self.assertEqual(run(False).stdout, "")
+        (self.repo / "src/Thing.cpp").write_text('#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tthis->field_0x8 = 1;\n}\n')
+        git(self.repo, "commit", "-qam", "the treatment's commit", "--no-verify")
+        self.assertEqual(json.loads(run(False).stdout)["decision"], "block")  # once it commits, it is checked
 
 
 if __name__ == "__main__":

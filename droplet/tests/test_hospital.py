@@ -358,6 +358,17 @@ class HospitalTests(unittest.TestCase):
         self.assertIn("I-PASS", c["escalations"][-1]["why"])
         self.assertTrue((self.cases / "pr431/handoff-1.md").exists())
 
+    def test_a_workup_handoff_keeps_the_plan_for_the_chief(self):
+        self.triage()
+
+        def workup(w, n, p):
+            w.files[n]["home/case/plan.md"] = PLAN.encode()
+            w.files[n]["home/case/handoff.md"] = b"# I-PASS\nneeds a Chief ruling"
+        self.ward.on["workup"] = workup
+        self.run_until_closed()
+        self.assertEqual(self.hosp.load("pr431")["stage"], "escalated")
+        self.assertIn("Something for Approach", (self.cases / "pr431/plan-r1-handoff.md").read_text())
+
     def test_a_case_over_1000_lines_must_be_split(self):
         self.triage()
         self.ward.on["treatment"] = lambda w, n, p: w.commit({"src/Big.cpp": "int x;\n" * 1001})
