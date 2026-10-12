@@ -647,12 +647,12 @@ class HospitalTests(unittest.TestCase):
     def test_a_unit_below_its_start_escalates(self):
         self.triage()
         self.reports["head"] = report(matched=156, other=90.0)  # one function better, one match lost
-        self.assert_no_progress_escalates("matched functions 156 < 157")
+        self.assert_no_progress_escalates("matched_functions 156 < 157")
 
     def test_a_lower_text_score_escalates(self):
         self.triage()
         self.reports["head"] = report(other=80.0, text=96.0)
-        self.assert_no_progress_escalates(".text score")
+        self.assert_no_progress_escalates("section:.text 96.0000% < 97.0000%")
 
     def test_a_unit_below_its_floor_escalates(self):
         self.triage(floors={"Thing": 158})
@@ -665,6 +665,72 @@ class HospitalTests(unittest.TestCase):
     def test_a_case_without_units_cannot_discharge(self):
         self.triage(units=[])
         self.assert_no_progress_escalates("lists no units")
+
+    def test_a_section_below_its_start_escalates(self):
+        self.triage()
+        self.reports["head"] = report(other=80.0, text=98.0)
+        self.reports["head"]["units"][0]["sections"][0]["fuzzy_match_percent"] = 99.0  # .data 100 -> 99
+        self.assert_no_progress_escalates("section:.data 99.0000% < 100.0000%")
+
+    def test_chief_floor_overrides_accept_a_measured_loss(self):
+        self.triage()
+        # a loss the Chief accepted: two matches and the .data score; something else still improves
+        self.reports["head"] = report(matched=155, other=80.0, text=97.0)
+        self.reports["head"]["units"][0]["sections"][0]["fuzzy_match_percent"] = 99.33
+        with self.assertRaises(H.HospitalError):
+            self.hosp.accept_floor("pr431", "Thing", "matched_functions", "155", "pr431 R13")  # root only
+        self.hosp._root = True
+        for metric, value in (("matched_functions", "155.5"), ("bogus", "1"), ("fuzzy", "x")):
+            with self.assertRaises(H.HospitalError):
+                self.hosp.accept_floor("pr431", "Thing", metric, value, "pr431 R13")
+        with self.assertRaises(H.HospitalError):
+            self.hosp.accept_floor("pr431", "Thing", "fuzzy", "1", " ")  # a ruling needs a reference
+        self.hosp.accept_floor("pr431", "Thing", "matched_functions", "155", "pr431 R13, Chief 2026-10-12")
+        self.hosp.accept_floor("pr431", "Thing", "matched_code", "start-20", "pr431 R13, Chief 2026-10-12")
+        self.hosp.accept_floor("pr431", "Thing", "section:.data", "99.33", "pr431 rdata ruling")
+        self.hosp._root = False
+        self.assertIn("accepted floor: Thing section:.data >= 99.33 (pr431 rdata ruling)", self.hosp.status("pr431"))
+        out = self.run_until_closed()
+        c = self.hosp.load("pr431")
+        self.assertEqual(c["stage"], "discharged", "\n".join(out))
+        d = json.loads((self.cases / "pr431/discharge.json").read_text())
+        self.assertEqual(d["progress"]["units"]["Thing"]["overrides"]["matched_functions"]["value"], "155")
+        md = (self.cases / "pr431/checklist.md").read_text()
+        self.assertIn("The Chief's accepted floors", md)
+        self.assertIn("- Thing: section:.data >= 99.33 (pr431 rdata ruling)", md)
+        self.assertTrue(any("Chief accepted floor" in line for line in
+                            (self.cases / "pr431/events.jsonl").read_text().splitlines()))
+
+    def test_an_accepted_floor_still_bounds_the_loss(self):
+        self.triage()
+        self.hosp._root = True
+        self.hosp.accept_floor("pr431", "Thing", "matched_functions", "156", "pr431 R13")
+        self.hosp._root = False
+        self.reports["head"] = report(matched=155, other=80.0)  # one more lost than the Chief accepted
+        self.assert_no_progress_escalates("matched_functions 155 < 156, the Chief's accepted floor 156")
+
+    def test_the_chief_can_waive_the_improvement_requirement(self):
+        self.triage()
+        self.reports["head"] = report()  # nothing improved
+        self.hosp._root = True
+        self.hosp.accept_floor("pr431", "Thing", "improved_functions", "0", "pr431 cleanup-only ruling")
+        self.hosp._root = False
+        out = self.run_until_closed()
+        self.assertEqual(self.hosp.load("pr431")["stage"], "discharged", "\n".join(out))
+        self.assertIn("waived by the Chief (pr431 cleanup-only ruling)",
+                      (self.cases / "pr431/checklist.md").read_text())
+
+    def test_a_queued_case_is_listed_but_never_run(self):
+        self.triage()
+        self.hosp.queue("pr431-incl", "Restructure the includes.", "CitadelHeart includes", after="pr431")
+        self.assertIn("pr431-incl", self.hosp.status())
+        text = (self.cases / "queue/pr431-incl.md").read_text()
+        self.assertIn("After: case `pr431`", text)
+        out = self.hosp.charge()
+        self.assertEqual(len(out), 1)  # only pr431 advances
+        self.assertFalse((self.cases / "pr431-incl").exists())
+        with self.assertRaises(H.HospitalError):
+            self.hosp.queue("pr431-incl", "again")
 
     def test_progress_function_matching(self):
         self.assertTrue(H.function_targets(["Thing::Real"], "?Real@Thing@@QAEXXZ"))

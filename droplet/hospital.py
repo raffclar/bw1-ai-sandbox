@@ -25,9 +25,10 @@ Roles
                     setup + `ninja baseline`; the case's start (measured once per start, then cached) and the head,
                     each with tools/ and configure.py overlaid from the base, objects deleted, `ninja all_source` and
                     decomp-regress.py --refresh (--fail-on-regression for the head). Then PROGRESS: each of the case's
-                    units at or above its start (matched functions, matched code, fuzzy and .text score) and its
-                    triage floor (--floor UNIT=N matched functions), and at least one target function (the case's
-                    functions, else any function of its units) scoring higher than at the start. No progress
+                    units at or above its start (matched functions, matched code, fuzzy and every section's score)
+                    and its triage floor (--floor UNIT=N matched functions), and at least one target function (the
+                    case's functions, else any function of its units) scoring higher than at the start. A Chief floor
+                    override (accept-floor) replaces the start as the floor for one unit and metric. No progress
                     ESCALATES to the Chief rather than going back to treatment. Writes checklist.md and
                     discharge.json (head, passed), which the publisher requires.
   Chief             the user, as root: `status` lists escalations; `precedent` appends to the root-owned precedent
@@ -55,9 +56,16 @@ Usage (as the sandbox user, except the Chief commands):
                      [--floor UNIT=MATCHED_FUNCTIONS]... [--fellow-model M] [--attending-model M] [--effort E]
   hospital.py advance ID          one step: evaluate the finished stage, then launch the next
   hospital.py charge              advance every open case (the bw1-hospital-charge timer; installed disabled)
-  hospital.py status [ID]         cases, stages, rounds and escalations
+  hospital.py status [ID]         cases, stages, rounds and escalations, and the queued cases
+  hospital.py queue ID --brief FILE [--title T] [--after CASE]
+                                  record a case to triage later (cases/queue/ID.md); nothing runs. When its turn
+                                  comes, triage it with the command its file names
   hospital.py discharge ID        run the Discharge Nurse now (the case must be in its discharge stage)
   Chief (root): precedent TEXT | release ID --head SHA | allow-paths ID --head SHA PATH... |
+                accept-floor ID --unit U --metric M --value V --ref TEXT   (an accepted loss: V is the new floor for
+                  that unit and metric, a number or start-N; metrics: matched_functions, matched_code, fuzzy,
+                  section:<name> such as section:.text or section:.rdata, and improved_functions (0 waives "a
+                  target function improved")) |
                 resolve ID --stage workup|plan_review|treatment|code_review|discharge [--note TEXT] [--reset-rounds] |
                 hold ID [--off]
 """
@@ -370,11 +378,42 @@ def report_unit(report: dict, unit: str):
 def unit_scores(u: dict) -> dict:
     m = u.get("measures", {})
     text = next((x for x in u.get("sections", []) if x.get("name") == ".text"), {})
-    return {"matched_functions": int(m.get("matched_functions", 0) or 0),
-            "total_functions": int(m.get("total_functions", 0) or 0),
-            "matched_code": int(m.get("matched_code", 0) or 0), "total_code": int(m.get("total_code", 0) or 0),
-            "fuzzy": float(m.get("fuzzy_match_percent", 0.0) or 0.0),
-            "text_fuzzy": float(text.get("fuzzy_match_percent", 0.0) or 0.0)}
+    out = {"matched_functions": int(m.get("matched_functions", 0) or 0),
+           "total_functions": int(m.get("total_functions", 0) or 0),
+           "matched_code": int(m.get("matched_code", 0) or 0), "total_code": int(m.get("total_code", 0) or 0),
+           "fuzzy": float(m.get("fuzzy_match_percent", 0.0) or 0.0),
+           "text_fuzzy": float(text.get("fuzzy_match_percent", 0.0) or 0.0)}
+    for x in u.get("sections", []):
+        if x.get("name"):
+            out["section:" + x["name"]] = float(x.get("fuzzy_match_percent", 0.0) or 0.0)
+    return out
+
+
+FLOOR_METRICS = ("matched_functions", "matched_code", "fuzzy", "improved_functions")  # plus section:<name>
+INT_METRICS = ("matched_functions", "matched_code", "improved_functions")
+FLOAT_TOL = 0.01  # a Chief's percentage is given to the hundredth
+
+
+def valid_floor(metric: str, value: str) -> bool:
+    import re as _re
+    if metric not in FLOOR_METRICS and not _re.fullmatch(r"section:\.?[\w$.]+", metric):
+        return False
+    return bool(_re.fullmatch(r"(start-)?\d+(\.\d+)?", value)) and \
+        not (metric in INT_METRICS and "." in value)
+
+
+def resolve_floor(value: str, start: float) -> float:
+    """A Chief floor: an absolute number, or start-N (N below the unit's score at the start)."""
+    return start - float(value[6:]) if value.startswith("start-") else float(value)
+
+
+def floor_overrides(overrides, unit: str) -> dict:
+    """{metric: the latest override} for a unit (an override is the Chief's {unit, metric, value, ref, at})."""
+    out = {}
+    for o in overrides or []:
+        if o.get("unit") == unit:
+            out[o.get("metric")] = o
+    return out
 
 
 def function_targets(names, function: str) -> bool:
@@ -390,8 +429,9 @@ def function_targets(names, function: str) -> bool:
     return False
 
 
-def progress(c: dict, start_report, head_report):
-    """(problems, record) for the case's progress from its start to its head (see the docstring)."""
+def progress(c: dict, start_report, head_report, overrides=()):
+    """(problems, record) for the case's progress from its start to its head (see the docstring). overrides are
+    the Chief's accepted floors (chief.json "floor_overrides")."""
     units, floors, wanted = c.get("units") or [], c.get("floors") or {}, c.get("functions") or []
     if not units:
         return ["the case lists no units, so its progress can't be measured"], {}
@@ -404,13 +444,25 @@ def progress(c: dict, start_report, head_report):
             problems.append(f"{unit}: not in the {'head' if h_u is None else 'start'} report")
             continue
         s, h = unit_scores(s_u), unit_scores(h_u)
-        record["units"][unit] = {"start": s, "head": h, "floor": floors.get(unit)}
-        for key, label in (("matched_functions", "matched functions"), ("matched_code", "matched code")):
-            if h[key] < s[key]:
-                problems.append(f"{unit}: {label} {h[key]} < {s[key]} at the start")
-        for key, label in (("fuzzy", "fuzzy match"), ("text_fuzzy", ".text score")):
-            if h[key] < s[key] - EPS:
-                problems.append(f"{unit}: {label} {h[key]:.4f}% < {s[key]:.4f}% at the start")
+        over = floor_overrides(overrides, unit)
+        record["units"][unit] = {"start": s, "head": h, "floor": floors.get(unit),
+                                 "overrides": {k: {"value": v.get("value"), "ref": v.get("ref")}
+                                               for k, v in over.items()}}
+        metrics = ["matched_functions", "matched_code", "fuzzy"] + sorted(k for k in s if k.startswith("section:"))
+        for key in metrics:
+            if key not in h:
+                problems.append(f"{unit}: no {key} at the head")
+                continue
+            integer = key in INT_METRICS
+            if key in over:
+                floor, why = resolve_floor(str(over[key]["value"]), s[key]), f"the Chief's accepted floor " \
+                    f"{over[key]['value']} ({over[key].get('ref', '')})"
+                tol = 0 if integer else FLOAT_TOL
+            else:
+                floor, why, tol = s[key], "the start", 0 if integer else EPS
+            if h[key] < floor - tol:
+                shown = (f"{h[key]} < {floor:g}" if integer else f"{h[key]:.4f}% < {floor:.4f}%")
+                problems.append(f"{unit}: {key} {shown}, {why}")
         if unit in floors and h["matched_functions"] < int(floors[unit]):
             problems.append(f"{unit}: {h['matched_functions']} matched functions, below the triage floor "
                             f"{floors[unit]}")
@@ -423,7 +475,11 @@ def progress(c: dict, start_report, head_report):
             if score > before.get(name, 0.0) + EPS:
                 improved.append(f"{unit}: {name} {before.get(name, 0.0):.2f}% -> {score:.2f}%")
     record["improved"] = improved
-    if not improved:
+    waived = [o for o in overrides or [] if o.get("metric") == "improved_functions" and o.get("unit") in units
+              and float(o.get("value", 1)) <= 0]
+    if waived:
+        record["improvement_waived"] = waived[-1].get("ref", "")
+    if not improved and not waived:
         problems.append("no target function improved from the start "
                         + (f"(functions {', '.join(wanted)})" if wanted else f"(units {', '.join(units)})"))
     return problems, record
@@ -906,7 +962,8 @@ class Hospital:
             start_report = load_report(workdir / ("base-report.json" if start == c["base"] else "start-report.json"))
             if start != c["base"] and cached_start(workdir) != start:
                 start_report = None
-            pproblems, record = progress(c, start_report, load_report(workdir / "head-report.json"))
+            pproblems, record = progress(c, start_report, load_report(workdir / "head-report.json"),
+                                         self.chief(cid).get("floor_overrides") or [])
             item("progress", "Progress: units at or above the start and floor, a target function improved",
                  pproblems)
             if record.get("units") and not c.get("baseline"):
@@ -973,6 +1030,41 @@ class Hospital:
         self.event(c, f"Chief released head {head[:10]} for publishing")
         return f"{cid}: head {head[:10]} released"
 
+    def queue(self, cid: str, brief: str, title: str = "", after: str = "") -> str:
+        """A case for later: its brief in cases/queue/<id>.md. Nothing is triaged or launched."""
+        self.dir(cid)  # validates the id
+        q = self.cases / "queue"
+        q.mkdir(parents=True, exist_ok=True)
+        p = q / f"{cid}.md"
+        if p.exists() or (self.cases / cid).exists():
+            raise HospitalError(f"case {cid} exists")
+        head = [f"# Queued case {cid}: {title or cid}", "", f"- Queued: {now()}"]
+        if after:
+            head.append(f"- After: case `{after}` (start from its discharged, released head)")
+        p.write_text("\n".join(head) + "\n\n" + brief.strip() + "\n", encoding="utf-8")
+        return f"{cid}: queued in {p}"
+
+    def queued(self) -> list:
+        q = self.cases / "queue"
+        out = []
+        for p in sorted(q.glob("*.md")) if q.is_dir() else []:
+            first = p.read_text(encoding="utf-8").splitlines()[:1]
+            out.append(f"{p.stem:24} queued       {first[0].split(': ', 1)[-1][:70] if first else ''}")
+        return out
+
+    def accept_floor(self, cid: str, unit: str, metric: str, value: str, ref: str) -> str:
+        """The Chief accepts a loss: value becomes the floor of this unit's metric at discharge (chief.json)."""
+        if not unit or not ref.strip():
+            raise HospitalError("accept-floor needs --unit and a --ref to the case and ruling")
+        if not valid_floor(metric, str(value)):
+            raise HospitalError(f"bad floor {metric}={value} (metrics {', '.join(FLOOR_METRICS)} or "
+                                "section:<name>; value a number or start-N, whole for counts)")
+        entry = {"unit": unit, "metric": metric, "value": str(value), "ref": ref.strip(), "at": now()}
+        self.write_chief(cid, lambda d: d.setdefault("floor_overrides", []).append(entry))
+        c = self.load(cid)
+        self.event(c, f"Chief accepted floor {unit} {metric} >= {value} ({ref.strip()})")
+        return f"{cid}: floor {unit} {metric} >= {value} accepted"
+
     def allow_paths(self, cid: str, head: str, paths) -> str:
         if not SHA_RE.match(head):
             raise HospitalError("--head must be a full sha")
@@ -1026,6 +1118,11 @@ class Hospital:
                     escalated.append(f"  {i}: [{e['stage']}] {e['why']} ({e['at']})")
             for v in c.get("violations", []):
                 lines.append(f"    violation: {v['what']} ({v['at']})")
+            for o in self.chief(i).get("floor_overrides") or []:
+                lines.append(f"    accepted floor: {o.get('unit')} {o.get('metric')} >= {o.get('value')} "
+                             f"({o.get('ref')})")
+        if not cid:
+            lines += self.queued()
         if escalated:
             lines += ["", "Escalations waiting for the Chief (resolve as root: hospital.py resolve ID --stage S "
                           "[--note ...]):", *escalated]
@@ -1049,6 +1146,12 @@ def checklist_md(result: dict) -> str:
             out.append(f"| {unit} | {s['matched_functions']}/{s['total_functions']} -> "
                        f"{h['matched_functions']}/{h['total_functions']} | {s['fuzzy']:.2f} -> {h['fuzzy']:.2f} | "
                        f"{s['text_fuzzy']:.2f} -> {h['text_fuzzy']:.2f} | {v.get('floor') or '-'} |")
+        accepted = [f"- {u}: {m} >= {o['value']} ({o['ref']})" for u, v in prog["units"].items()
+                    for m, o in (v.get("overrides") or {}).items()]
+        if accepted:
+            out += ["", "The Chief's accepted floors (they replace the start for these metrics):", "", *accepted]
+        if prog.get("improvement_waived"):
+            out += ["", f"The improvement requirement is waived by the Chief ({prog['improvement_waived']})."]
         out += ["", f"Improved functions ({len(prog.get('improved', []))}):", ""]
         out += [f"- {x}" for x in prog.get("improved", [])[:40]] or ["- none"]
     if result.get("warnings"):
@@ -1086,6 +1189,17 @@ def main(argv=None) -> int:
     r = sub.add_parser("release")
     r.add_argument("id")
     r.add_argument("--head", required=True)
+    qu = sub.add_parser("queue")
+    qu.add_argument("id")
+    qu.add_argument("--brief", required=True)
+    qu.add_argument("--title", default="")
+    qu.add_argument("--after", default="")
+    af = sub.add_parser("accept-floor")
+    af.add_argument("id")
+    af.add_argument("--unit", required=True)
+    af.add_argument("--metric", required=True)
+    af.add_argument("--value", required=True)
+    af.add_argument("--ref", required=True, help="the case and the ruling, e.g. 'pr431 R13 ruling 2026-10-12'")
     al = sub.add_parser("allow-paths")
     al.add_argument("id")
     al.add_argument("--head", required=True)
@@ -1138,6 +1252,10 @@ def main(argv=None) -> int:
             print(hosp.precedent(a.text))
         elif a.cmd == "release":
             print(hosp.release(a.id, a.head))
+        elif a.cmd == "queue":
+            print(hosp.queue(a.id, Path(a.brief).read_text(encoding="utf-8"), a.title, a.after))
+        elif a.cmd == "accept-floor":
+            print(hosp.accept_floor(a.id, a.unit, a.metric, a.value, a.ref))
         elif a.cmd == "allow-paths":
             print(hosp.allow_paths(a.id, a.head, a.paths))
         elif a.cmd == "resolve":
