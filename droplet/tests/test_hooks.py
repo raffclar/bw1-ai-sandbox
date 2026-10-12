@@ -210,6 +210,42 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("inline-asm-existing", p.stdout + p.stderr)
 
+    @unittest.skipUnless(shutil.which("sh") or shutil.which("bash"), "git hooks need sh")
+    def test_pre_commit_checks_a_conflicted_merge_against_what_it_merges(self):
+        self.assertEqual(self.install().returncode, 0)
+        env = self.shim_env()
+        base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        # upstream moves on: a tool, a config line at the top, and Thing.cpp (conflicting with the case)
+        git(self.repo, "checkout", "-q", "-b", "up", env=env)
+        (self.repo / "tools").mkdir()
+        (self.repo / "tools/decomp-diff.py").write_text("print('upstream')\n")
+        sym = self.repo / "config/BW1W120/symbols.txt"
+        sym.write_text("up = .text:0x2;\n" + sym.read_text())
+        (self.repo / "src/Thing.cpp").write_text('#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tint up = 1;\n}\n')
+        git(self.repo, "add", "-A", env=env)
+        git(self.repo, "commit", "-qm", "upstream", "--no-verify", env=env)
+        # the case: a config line at the end and its own Thing.cpp change
+        git(self.repo, "checkout", "-q", "-b", "case", base, env=env)
+        sym.write_text(sym.read_text() + "case = .text:0x3;\n")
+        (self.repo / "src/Thing.cpp").write_text('#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tint mine = 2;\n}\n')
+        git(self.repo, "add", "-A", env=env)
+        git(self.repo, "commit", "-qm", "case", "--no-verify", env=env)
+        self.assertNotEqual(git(self.repo, "merge", "--no-edit", "up", env=env, check=False).returncode, 0)
+        (self.repo / "src/Thing.cpp").write_text('#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tint up = 1;\n'
+                                                 '\tint mine = 2;\n}\n')
+        git(self.repo, "add", "-A", env=env)
+        p = git(self.repo, "commit", "--no-edit", env=env, check=False)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)  # upstream's tool and the auto-merged config pass
+        # a merge that also changes a protected file beyond git's automatic merge is refused
+        git(self.repo, "reset", "-q", "--hard", "HEAD~1", env=env)
+        git(self.repo, "merge", "--no-edit", "up", env=env, check=False)
+        (self.repo / "src/Thing.cpp").write_text('#include "Thing.h"\n\nvoid Thing::Real()\n{\n}\n')
+        (self.repo / "tools/decomp-diff.py").write_text("print('always 100%')\n")
+        git(self.repo, "add", "-A", env=env)
+        p = git(self.repo, "commit", "--no-edit", env=env, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("tamper-path", p.stdout + p.stderr)
+
     def test_stop_hook_blocks_once(self):
         self.assertEqual(self.install().returncode, 0)
         base = git(self.repo, "rev-parse", "HEAD").stdout.strip()

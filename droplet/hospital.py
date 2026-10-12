@@ -38,6 +38,13 @@ Roles
                     log (injected into every prompt); `release` lets the publisher publish one head of a held case;
                     `allow-paths` approves protected-path changes for one head; `resolve` moves an escalated case on.
 
+Merge cases (triage --merge-upstream)
+  The Fellow merges the case's base (current upstream main) into its start with a merge commit, no rebase, and
+  resolves the conflicts. Then the merge commit is allowed in the history when one of its parents is the base, the
+  protected paths may take exactly the content of git's automatic merge of start and base (`allow_from`, a tree),
+  the delta is measured from that automatic merge (the resolution, not upstream's changes), and regressions are
+  judged both ways between the base and the start (a unit's change that upstream made is not the case's).
+
 STOP files
   /etc/bw1-sandbox/STOP halts everything: the publisher units and the hospital (advance/charge).
   /etc/bw1-sandbox/STOP-PUBLISH halts only the publisher (both its units and publisher.py itself), so the hospital
@@ -266,6 +273,16 @@ class SandboxWard:
 # ------------------------------------------------------------------------------------------------- verification
 
 
+def merge_tree(repo, a: str, b: str) -> str:
+    """The tree of git's automatic merge of a and b (conflicted files keep their markers)."""
+    p = subprocess.run(["git", "-c", "safe.directory=*", "-C", str(repo), "merge-tree", "--write-tree", a, b],
+                       capture_output=True, text=True)
+    tree = (p.stdout.split() or [""])[0]
+    if p.returncode not in (0, 1) or not SHA_RE.match(tree):
+        raise HospitalError(f"git merge-tree {a[:10]} {b[:10]} failed: {p.stderr.strip()[-300:]}")
+    return tree
+
+
 def worker_setup_argv(toml_path: str = SANDBOX_TOML) -> list:
     import tomllib
     with open(toml_path, "rb") as f:
@@ -449,7 +466,7 @@ def worse_metrics(a: dict, b: dict) -> set:
     return out
 
 
-def regressions(base_report, start_report, head_report, case_units=()) -> list:
+def regressions(base_report, start_report, head_report, case_units=(), merge: bool = False) -> list:
     """No regression against the base beyond what the case's start already had, and none from start to head:
     a unit outside the case may not be worse at the head than at the base on any metric on which the start was not
     already worse, nor worse than at the start; a unit present at the start may not be gone at the head. The
@@ -464,14 +481,17 @@ def regressions(base_report, start_report, head_report, case_units=()) -> list:
         if is_case_unit(name, case_units):
             continue
         if name not in H:
-            if name in S:
+            if name in S and not (merge and name not in B):  # in a merge, upstream may drop a unit
                 problems.append(f"{name}: removed at the head")
             continue
         new = set()
         if name in B:
             new |= worse_metrics(B[name], H[name]) - (worse_metrics(B[name], S[name]) if name in S else set())
         if name in S:
-            new |= worse_metrics(S[name], H[name])
+            # in a merge the base is upstream's newer state: a unit upstream itself left below the start is not
+            # the case's regression
+            new |= worse_metrics(S[name], H[name]) - (worse_metrics(S[name], B[name]) if merge and name in B
+                                                      else set())
         if new:
             problems.append(f"{name}: worse at the head ({', '.join(sorted(new))})")
     return problems
@@ -648,7 +668,8 @@ class Hospital:
 
     def triage(self, cid: str, fellow: str, brief: str, title: str = "", units=(), functions=(), impact: str = "mid",
                difficulty: str = "mid", constraints: str = "", base: str = "", start: str = "", hold: bool = False,
-               fellow_model: str = "", attending_model: str = "", effort: str = "", floors=None) -> dict:
+               fellow_model: str = "", attending_model: str = "", effort: str = "", floors=None,
+               merge_upstream: bool = False) -> dict:
         d = self.dir(cid)
         if d.exists():
             raise HospitalError(f"case {cid} exists")
@@ -668,6 +689,11 @@ class Hospital:
             base = git(repo, "merge-base", "upstream/main", start, check=False) or \
                 git(repo, "merge-base", "origin/main", start)
         base = git(repo, "rev-parse", f"{base}^{{commit}}")
+        allow_from = ""
+        if merge_upstream:
+            if not start:
+                raise HospitalError("--merge-upstream needs --start (the head to merge upstream into)")
+            allow_from = merge_tree(repo, start, base)
         d.mkdir(parents=True)
         c = {"id": cid, "title": title or cid, "fellow": fellow, "base": base, "start": start, "old_head": "",
              "hold": bool(hold), "stage": "workup", "rounds": 0, "attendings": 0, "running": None, "rerun": 0,
@@ -675,7 +701,8 @@ class Hospital:
              "units": list(units), "functions": list(functions), "models": {"fellow": fellow_model,
                                                                             "attending": attending_model},
              "effort": effort, "created": now(), "feedback": "", "reviews": [], "reviewed_head": "",
-             "plan_review": "", "code_review": "", "floors": dict(floors or {})}
+             "plan_review": "", "code_review": "", "floors": dict(floors or {}),
+             "merge": bool(merge_upstream), "allow_from": allow_from}
         if start and self.ward.head(fellow) != start:
             try:
                 old_head = self.ward.start_from(fellow, start, cid)
@@ -690,6 +717,9 @@ class Hospital:
             f"- Start: `{start or '(the fellow starts from origin/base)'}`"
             + (f" (the fellow's earlier head `{old_head}` is kept as branch case-old/{cid})" if old_head else ""),
             f"- Hold: {'yes: the Chief decides on publishing' if hold else 'no'}",
+            *([f"- Merge case: merge the base `{base}` (upstream main) into the start with a merge commit (no "
+               f"rebase), and resolve the conflicts. Protected files may take exactly git's automatic merge "
+               f"(tree `{allow_from}`)."] if merge_upstream else []),
             f"- Units: {', '.join(units) or '(see brief)'}",
             f"- Functions: {', '.join(functions) or '(see brief)'}",
             "- Progress floor (matched functions): "
@@ -712,7 +742,8 @@ class Hospital:
     # --- prompts -----------------------------------------------------------------------------
 
     def gate_cmd(self, c: dict) -> str:
-        allow = f" --allow-paths-from {c['start']}" if c.get("start") else ""
+        frm = c.get("allow_from") or c.get("start")
+        allow = f" --allow-paths-from {frm}" if frm else ""
         return f"python3 ~/.claude/hooks/quality_gate.py --base {c['base']}{allow}"
 
     def review_template(self, c: dict, kind: str, n: int) -> str:
@@ -759,8 +790,9 @@ class Hospital:
                     self.ward.remove(fellow, f)
                 self.ward.write(fellow, "home/case/case.md", self.get(c["id"], "case.md").encode())
                 self.ward.write(fellow, "home/case/gate-base", (c["base"] + "\n").encode())
-                if c.get("start"):
-                    self.ward.write(fellow, "home/case/gate-allow", (c["start"] + "\n").encode())
+                if c.get("allow_from") or c.get("start"):
+                    self.ward.write(fellow, "home/case/gate-allow",
+                                    ((c.get("allow_from") or c["start"]) + "\n").encode())
             head_before = self.ward.head(fellow) if exists else ""
             prompt = self.template("fellow-workup.md" if stage == "workup" else "fellow-treatment.md",
                                    **self.common(c))
@@ -898,7 +930,8 @@ class Hospital:
 
     def delta(self, c: dict, head: str) -> int:
         lines = 0
-        for row in git(self.ward.repo, "diff", "--numstat", f"{c.get('start') or c['base']}..{head}").splitlines():
+        frm = c.get("allow_from") if c.get("merge") else (c.get("start") or c["base"])
+        for row in git(self.ward.repo, "diff", "--numstat", frm, head).splitlines():
             cols = row.split("\t")
             if len(cols) >= 2 and cols[0].isdigit() and cols[1].isdigit():
                 lines += int(cols[0]) + int(cols[1])
@@ -967,10 +1000,14 @@ class Hospital:
         bad = sorted(set(re.findall(r"^(\S+?):\d+:\d+: (?:error|warning)", p.stderr, re.M)))
         return [f"not clang-format clean: {', '.join(bad[:10]) or p.stderr.strip()[-300:]}"]
 
-    def history_problems(self, repo: Path, start: str, head: str, reviewed: str) -> list:
+    def history_problems(self, repo: Path, start: str, head: str, reviewed: str, merge_base: str = "") -> list:
+        """merge_base (a merge case's base): merge commits with it as a parent are allowed."""
         problems = []
-        if git(repo, "rev-list", "--merges", f"{start}..{head}"):
-            problems.append("merge commits in the case")
+        for m in git(repo, "rev-list", "--merges", f"{start}..{head}").split():
+            parents = git(repo, "rev-list", "--parents", "-n", "1", m).split()[1:]
+            if not (merge_base and merge_base in parents):
+                problems.append(f"merge commit {m[:10]} in the case"
+                                + (f" (only merges of the base {merge_base[:10]} are allowed)" if merge_base else ""))
         for row in git(repo, "log", "--format=%h %s", f"{start}..{head}").splitlines():
             sha, _, subject = row.partition(" ")
             if any(p.search(subject) for p in BAD_SUBJECTS):
@@ -1022,7 +1059,8 @@ class Hospital:
         item("templates", "Plan and reviews follow their templates", tmpl)
         item("review", "Last code review APPROVE on this head, no unresolved [B#]", self.review_problems(c, head))
         try:
-            findings = quality_gate.run(str(repo), c["base"], head, allow_from=c.get("start", ""),
+            findings = quality_gate.run(str(repo), c["base"], head,
+                                        allow_from=c.get("allow_from") or c.get("start", ""),
                                         allow_paths=self.allowed_paths(cid, head))
         except quality_gate.GitError as e:
             findings = [quality_gate.Finding("tamper-path", "(gate error)", 0, "", str(e))]
@@ -1031,7 +1069,8 @@ class Hospital:
         item("gate", "Quality gate green (host, git objects only)", [f"{f.rule}: {f.path}:{f.line}" for f in hard])
         item("format", "clang-format 22 clean", self.format_problems(repo, c["base"], head, workdir))
         item("history", "Clean history (no merges, snapshots, fixup!/WIP; head == reviewed head)",
-             self.history_problems(repo, start, head, c.get("reviewed_head", "")))
+             self.history_problems(repo, start, head, c.get("reviewed_head", ""),
+                                   c["base"] if c.get("merge") else ""))
         delta = self.delta(c, head)
         item("delta", f"Case delta at most {MAX_DELTA} lines ({delta})",
              [] if delta <= MAX_DELTA else [f"{delta} changed lines: split the case"])
@@ -1057,7 +1096,7 @@ class Hospital:
             head_report = load_report(workdir / "head-report.json")
             item("regress", "No regression against the base beyond the start's, none from start to head",
                  regressions(load_report(workdir / "base-report.json"), start_report, head_report,
-                             c.get("units") or []))
+                             c.get("units") or [], bool(c.get("merge"))))
             pproblems, record = progress(c, start_report, head_report,
                                          self.chief(cid).get("floor_overrides") or [])
             item("progress", "Progress: units at or above the start and floor, a target function improved",
@@ -1278,6 +1317,8 @@ def main(argv=None) -> int:
     t.add_argument("--base", default="")
     t.add_argument("--start", default="")
     t.add_argument("--hold", action="store_true")
+    t.add_argument("--merge-upstream", action="store_true",
+                   help="a merge case: the Fellow merges --base (upstream main) into --start")
     t.add_argument("--floor", action="append", default=[], metavar="UNIT=N",
                    help="the unit must end with at least N matched functions (objdiff report); repeatable")
     t.add_argument("--fellow-model", default="")
@@ -1339,7 +1380,7 @@ def main(argv=None) -> int:
             c = hosp.triage(a.id, a.fellow, Path(a.brief).read_text(encoding="utf-8"), a.title, split(a.units),
                             split(a.functions), a.impact, a.difficulty,
                             Path(a.constraints).read_text(encoding="utf-8") if a.constraints else "", a.base, a.start,
-                            a.hold, a.fellow_model, a.attending_model, a.effort, floors)
+                            a.hold, a.fellow_model, a.attending_model, a.effort, floors, a.merge_upstream)
             print(f"triaged {c['id']}: stage {c['stage']}, base {c['base'][:10]}, start {c['start'][:10]}, "
                   f"hold {c['hold']}" + (f", old head {c['old_head'][:10]}" if c["old_head"] else ""))
         elif a.cmd == "advance":

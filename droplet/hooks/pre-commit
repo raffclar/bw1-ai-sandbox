@@ -8,7 +8,16 @@ python3 "$hooks/no_extern.py" pre-commit || exit 1
 # Files that had inline asm at the case's base (or the merge-base with origin/main) may keep it: --asm-base
 asm_base=$(awk 'NR==1{print $1; exit}' "$HOME/case/gate-base" 2>/dev/null)
 [ -n "$asm_base" ] || asm_base=$(git merge-base origin/main HEAD 2>/dev/null)
-python3 "$hooks/quality_gate.py" --staged ${asm_base:+--asm-base "$asm_base"}
+merge_head=$(git rev-parse -q --verify MERGE_HEAD 2>/dev/null)
+if [ -n "$merge_head" ]; then
+	# A merge commit (a merge case: upstream main into the case). Check what the merge adds over the merged-in
+	# side; protected files may take exactly git's automatic merge of the two parents.
+	auto=$(git merge-tree --write-tree HEAD "$merge_head" 2>/dev/null | head -n 1)
+	python3 "$hooks/quality_gate.py" --staged --base "$merge_head" ${auto:+--allow-paths-from "$auto"} \
+		${asm_base:+--asm-base "$asm_base"}
+else
+	python3 "$hooks/quality_gate.py" --staged ${asm_base:+--asm-base "$asm_base"}
+fi
 status=$?
 if [ "$status" -eq 1 ]; then
 	echo "commit refused by the quality gate (hard failures above). Fix them; don't work around the gate." >&2

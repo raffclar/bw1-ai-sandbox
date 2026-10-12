@@ -711,6 +711,55 @@ class HospitalTests(unittest.TestCase):
         self.triage(units=[])
         self.assert_no_progress_escalates("lists no units")
 
+    def make_upstream(self):
+        """upstream main moves on from the base: a config change (it auto-merges with the start's) and a tool."""
+        git(self.repo, "checkout", "-q", "-b", "up", self.base)
+        self.write({"config/BW1W120/symbols.txt": "upstream = .text:0x3;\n" + SYMBOLS,
+                    "tools/decomp-diff.py": "print('upstream tool')\n"})
+        up = self.commit_all("upstream main moves on")
+        git(self.repo, "checkout", "-q", "fellow")
+        return up
+
+    def test_a_merge_case_merges_upstream_and_discharges(self):
+        up = self.make_upstream()
+        c = self.triage(cid="pr431m", base=up, merge_upstream=True)
+        self.assertTrue(c["merge"] and H.SHA_RE.match(c["allow_from"]))
+        self.assertIn("Merge case", (self.cases / "pr431m/case.md").read_text())
+        self.ward.on["treatment"] = lambda w, n, p: git(self.repo, "merge", "-q", "--no-edit", up)
+        out = self.run_until_closed("pr431m")
+        self.assertEqual(self.hosp.load("pr431m")["stage"], "discharged", "\n".join(out))
+        self.assertEqual(self.ward.files["first"]["home/case/gate-allow"].decode().strip(), c["allow_from"])
+        d = json.loads((self.cases / "pr431m/discharge.json").read_text())
+        items = {i["key"]: i for i in d["items"]}
+        self.assertTrue(items["history"]["ok"] and items["gate"]["ok"] and items["delta"]["ok"], items)
+        self.assertIn("(0)", items["delta"]["label"])  # the delta is measured from git's automatic merge
+
+    def test_a_merge_of_anything_but_the_base_is_refused(self):
+        up = self.make_upstream()
+        git(self.repo, "checkout", "-q", "-b", "other", self.base)
+        self.write({"src/Other.cpp": "int other;\n"})
+        other = self.commit_all("someone else's branch")
+        git(self.repo, "checkout", "-q", "fellow")
+        git(self.repo, "merge", "-q", "--no-edit", other)
+        head = git(self.repo, "rev-parse", "HEAD")
+        problems = self.hosp.history_problems(self.repo, self.old, head, head, up)
+        self.assertTrue(any("merge commit" in p for p in problems), problems)
+        self.assertEqual(self.hosp.history_problems(self.repo, self.old, head, head, other), [])
+
+    def test_merge_mode_regressions_ignore_what_upstream_changed(self):
+        start, base, head = report(), report(), report()
+        self.other(start, "runblack/Black/Up", 10)
+        self.other(base, "runblack/Black/Up", 8)  # upstream itself lowered it (e.g. a split)
+        self.other(head, "runblack/Black/Up", 8)
+        self.other(start, "runblack/fn_00401000", 1)  # a gap unit upstream's config removed
+        self.assertEqual(H.regressions(base, start, head, ["Thing"], merge=True), [])
+        self.assertTrue(H.regressions(base, start, head, ["Thing"], merge=False))
+        self.other(head, "runblack/Black/Up2", 1)
+        self.other(base, "runblack/Black/Up2", 5)
+        self.other(start, "runblack/Black/Up2", 5)
+        self.assertIn("runblack/Black/Up2: worse at the head",
+                      H.regressions(base, start, head, ["Thing"], merge=True)[0])
+
     def test_a_header_only_unit_is_noted_not_failed(self):
         self.triage(units=["Thing", "InfluenceCircle"])  # InfluenceCircle has no objdiff unit: header only
         out = self.run_until_closed()
