@@ -291,9 +291,12 @@ anyone's comments.
 PR #431 and AGENTS.md, plus anti-cheat rules: inline assembly (allowed only in files that already have it at the
 case's base, such as CPUCheck.cpp, and then reported as a warning; `__declspec(naked)` never), `_emit`, section and
 linker pragmas, bytes cast to functions, and any change to protected paths (build files, `config/**`, all of
-`tools/**` including `tools/matching_ledger.jsonl`, the agent rules and hooks), which also escalates to the Chief. It reads git objects only. It runs in three places: as each worker's git
-pre-commit hook (`--staged`), as the workers' Claude Stop hook (blocks once), and on the host in the Discharge Nurse
-and the publisher.
+`tools/**` including `tools/matching_ledger.jsonl`, the agent rules and hooks), which also escalates to the Chief.
+Header `#ifdef` toggles on new macros are hard failures, except a module-level guard: a `_LH_<NAME>_LIB_` macro that
+`configure.py` passes with `/D` to a Lionhead library (the Chief's precedent on pr431); defining one in a source file
+is a hard failure. It reads git objects only. It runs in three places: as each worker's git pre-commit hook
+(`--staged`), as the workers' Claude Stop hook (blocks once, and never while a case is still at its start), and on
+the host in the Discharge Nurse and the publisher.
 
 **Worker setup** (`sandbox.droplet.toml`'s `setup`, new workers only) unpacks `droplet/hooks` and the gate into
 `~/.claude/hooks/` and runs `install_hooks.py`: the hooks, the git pre-commit hook and
