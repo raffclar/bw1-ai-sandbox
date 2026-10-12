@@ -59,7 +59,7 @@ class FakeWard:
 
     @staticmethod
     def kind(prompt):
-        m = re.match(r"# Hospital case \S+: (workup|treatment|plan review|code review)", prompt)
+        m = re.search(r"^# Hospital case \S+: (workup|treatment|plan review|code review)", prompt, re.M)
         return m.group(1).replace(" review", "") if m else "?"
 
     def _run(self, name, prompt):
@@ -214,6 +214,11 @@ class HospitalTests(unittest.TestCase):
         self.assertIn("Something for Approach", att)
         self.assertIn("bwrsandman's review of PR #431", att)
         self.assertIn("A1 | No inline assembly", att)
+        # A resumed Fellow gets the harness rules in front (its session predates them); an Attending gets the
+        # preamble from the sandbox's spawn instead
+        fellow_prompts = [p for k, n, p in self.ward.calls if n == "first" and k == "resume"]
+        self.assertTrue(all(p.startswith("# Harness rules") and "Maintainer review rules" in p for p in fellow_prompts))
+        self.assertFalse(att.startswith("# Harness rules"))
         # The Fellow got its case and gate base in ~/case
         self.assertEqual(self.ward.files["first"]["home/case/gate-base"].decode().strip(), self.base)
         self.assertEqual(self.ward.files["first"]["home/case/gate-allow"].decode().strip(), self.start)

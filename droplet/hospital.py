@@ -388,6 +388,15 @@ class Hospital:
     def allowed_paths(self, cid: str, head: str) -> list:
         return list((self.chief(cid).get("allow_paths") or {}).get(head, []))
 
+    def harness_rules(self) -> str:
+        """The preamble's harness section (droplet/preamble-droplet.md), for prompts that skip the preamble."""
+        try:
+            text = (self.prompts.parent / "preamble-droplet.md").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        return ("# Harness rules (they apply to you even if your session started before them)\n\n"
+                + text.replace("\n## ", "\n### ") + "\n\n---\n\n")
+
     def template(self, name: str, **values) -> str:
         text = (self.prompts / name).read_text(encoding="utf-8")
         for k, v in values.items():
@@ -505,8 +514,10 @@ class Hospital:
             head_before = self.ward.head(fellow) if exists else ""
             prompt = self.template("fellow-workup.md" if stage == "workup" else "fellow-treatment.md",
                                    **self.common(c))
-            if self.ward.exists(fellow):
-                self.ward.resume(fellow, prompt, models.get("fellow", ""), c.get("effort", ""))
+            if exists:
+                # A resumed session never sees the preamble again, and an older worker started before these rules
+                # existed: the harness rules go in front of every resumed prompt.
+                self.ward.resume(fellow, self.harness_rules() + prompt, models.get("fellow", ""), c.get("effort", ""))
             else:
                 self.ward.spawn(fellow, prompt, models.get("fellow", ""), c.get("effort", ""))
             worker = fellow
