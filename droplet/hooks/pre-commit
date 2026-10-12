@@ -1,0 +1,17 @@
+#!/bin/sh
+# bw1 harness, worker git pre-commit hook (installed by install_hooks.py; its hash is checked at discharge).
+# Refuses a commit that adds `extern` or that the quality gate fails (hard failures, which include the anti-cheat
+# and tamper rules). Warnings are printed and don't block. Bypassing this hook (--no-verify) gains nothing: the
+# Discharge Nurse and the publisher run the same gate on the host.
+hooks="$HOME/.claude/hooks"
+python3 "$hooks/no_extern.py" pre-commit || exit 1
+python3 "$hooks/quality_gate.py" --staged
+status=$?
+if [ "$status" -eq 1 ]; then
+	echo "commit refused by the quality gate (hard failures above). Fix them; don't work around the gate." >&2
+	exit 1
+fi
+if [ "$status" -ne 0 ]; then
+	echo "pre-commit: the quality gate could not run (exit $status); the commit goes ahead, the host re-checks it" >&2
+fi
+exit 0

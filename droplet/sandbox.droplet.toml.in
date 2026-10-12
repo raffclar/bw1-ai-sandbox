@@ -26,7 +26,9 @@ required = "@GAME_VERSION@/runblack-decrypted.exe"   # droplet: from Terraform (
 [worker]
 cpus = @WORKER_CPUS@          # droplet: from Terraform (worker_cpus)
 memory = "@WORKER_MEMORY@"    # droplet: from Terraform (worker_memory)
-preamble = "preamble.md"
+# droplet: upstream's preamble.md with the harness rules (droplet/preamble-droplet.md: bwrsandman's review rules, the
+# hospital rules, the forbidden constructs) inserted before its "## Task" heading. setup-droplet.sh writes it.
+preamble = "preamble.droplet.md"
 # droplet: --version from Terraform (game_version), as the sandbox README says for other versions.
 # droplet: after configuring, mark the shared toolchain as built. It is a read-only copy of the host's, and a fresh
 # checkout makes the scripts that built it (download_tool.py, patch_compiler_headers.py) newer than it, so ninja would
@@ -97,65 +99,18 @@ if os.path.exists(os.path.join(formatter, "clang-format")):
         env["PATH"] = formatter + ":" + path
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, indent=2))
-# The project never uses `extern` (AGENTS.md "Globals": a global is a static member of its owning class, and a use
-# that can't be declared yet is commented out with a TODO). Two guards, with the publisher refusing a branch that
-# adds one as the last: a Claude Code hook that blocks an Edit/Write adding `extern` to a C/C++ file, and a git
-# pre-commit hook that refuses a commit adding one (catches shell edits too). Comment lines don't count.
-checker = """#!/usr/bin/env python3
-import json, os, re, subprocess, sys
-EXTERN = re.compile(r"\\bextern\\b")
-SOURCES = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".inl", ".inc")
-WHY = ("`extern` is never allowed in this project (AGENTS.md, Globals). Declare the global as a static data "
-       "member of its owning class in that class's header, or, if it can't be declared there yet, comment the "
-       "use out with a // TODO: explaining why.")
-def uses(text):
-    n = 0
-    for line in text.splitlines():
-        s = line.strip()
-        if not s.startswith(("//", "/*", "*")) and EXTERN.search(s.split("//")[0]):
-            n += 1
-    return n
-if len(sys.argv) > 1 and sys.argv[1] == "pre-commit":
-    diff = subprocess.run(["git", "diff", "--cached", "-U0", "--no-color", "--"] + ["*" + s for s in SOURCES],
-                          capture_output=True, text=True).stdout
-    added = [l[1:].strip() for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
-    bad = [l for l in added if uses(l)]
-    if bad:
-        sys.exit("commit refused: it adds extern: " + "; ".join(bad[:5]) + "\\n" + WHY)
-    sys.exit(0)
-data = json.load(sys.stdin)
-tool, args = data.get("tool_name", ""), data.get("tool_input", {})
-path = args.get("file_path", "")
-if not path.endswith(SOURCES):
-    sys.exit(0)
-if tool == "Write":
-    old = open(path, encoding="utf-8", errors="replace").read() if os.path.exists(path) else ""
-    added = uses(args.get("content", "")) - uses(old)
-elif tool == "Edit":
-    added = uses(args.get("new_string", "")) - uses(args.get("old_string", ""))
-elif tool == "MultiEdit":
-    added = sum(uses(e.get("new_string", "")) - uses(e.get("old_string", "")) for e in args.get("edits", []))
-else:
-    added = 0
-if added > 0:
-    print("Blocked: this edit adds extern. " + WHY, file=sys.stderr)
-    sys.exit(2)
-"""
-hook = pathlib.Path.home() / ".claude" / "hooks" / "no_extern.py"
-hook.parent.mkdir(parents=True, exist_ok=True)
-hook.write_text(checker)
-hook.chmod(0o755)
-settings_path = pathlib.Path.home() / ".claude" / "settings.json"
-settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
-pre = settings.setdefault("hooks", {}).setdefault("PreToolUse", [])
-if not any(str(hook) in h.get("command", "") for entry in pre for h in entry.get("hooks", [])):
-    pre.append({"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": f"python3 {hook}"}]})
-settings_path.parent.mkdir(parents=True, exist_ok=True)
-settings_path.write_text(json.dumps(settings, indent=2))
-git_hook = pathlib.Path(subprocess.run(["git", "rev-parse", "--git-path", "hooks/pre-commit"], capture_output=True,
-                                       text=True, check=True).stdout.strip())
-git_hook.parent.mkdir(parents=True, exist_ok=True)
-git_hook.write_text("#!/bin/sh\nexec python3 " + str(hook) + " pre-commit\n")
-git_hook.chmod(0o755)
+# The harness's worker hooks (droplet/hooks, README "Quality gate and hooks"): the quality gate, the no-extern check,
+# the Stop-hook gate and the git pre-commit hook, plus CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=42 in Claude Code's settings.
+# setup-droplet.sh packs them into the base64 tar.gz below; install_hooks.py installs them idempotently and
+# self-checks (their hashes are also in /etc/bw1-sandbox/integrity.json and compared at discharge).
+import base64, io, tarfile
+hooks = pathlib.Path.home() / ".claude" / "hooks"
+hooks.mkdir(parents=True, exist_ok=True)
+with tarfile.open(fileobj=io.BytesIO(base64.b64decode("@HOOKS_BUNDLE@")), mode="r:gz") as bundle:
+    for member in bundle.getmembers():
+        if member.isfile() and "/" not in member.name and not member.name.startswith("."):
+            (hooks / member.name).write_bytes(bundle.extractfile(member).read())
+if subprocess.run([sys.executable, str(hooks / "install_hooks.py"), "--repo", "."]).returncode != 0:
+    sys.exit("setup: the worker hooks failed their self-check (see above)")
 ''']
 packages = ["ninja-build", "clang-format", "llvm", "python3-pefile", "python3-yaml"]

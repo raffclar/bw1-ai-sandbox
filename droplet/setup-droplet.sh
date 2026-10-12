@@ -121,17 +121,22 @@ git -C "$SB" checkout -q --detach "$SANDBOX_REF"
 # Root-owned and read-only for everyone else, except the project clone inside it.
 find "$SB" -path "$CLONE" -prune -o -exec chown root:root {} +
 find "$SB" -path "$CLONE" -prune -o -exec chmod go-w {} +
-sed -e "s|@WORKER_CPUS@|$WORKER_CPUS|" -e "s|@WORKER_MEMORY@|$WORKER_MEMORY|" -e "s|@GAME_VERSION@|$GAME_VERSION|g" \
-	"$DROPLET/sandbox.droplet.toml.in" \
-	>"$SB/sandbox.droplet.toml"
+# The settings, with the worker hooks (droplet/hooks + quality_gate.py) packed into the worker setup.
+python3 "$DROPLET/render_config.py" toml --template "$DROPLET/sandbox.droplet.toml.in" --out "$SB/sandbox.droplet.toml" \
+	--set WORKER_CPUS="$WORKER_CPUS" --set WORKER_MEMORY="$WORKER_MEMORY" --set GAME_VERSION="$GAME_VERSION"
 chmod 0644 "$SB/sandbox.droplet.toml"
+# The workers' preamble: upstream's preamble.md (left untouched) with the harness rules inserted between markers
+# before its "## Task" heading; regenerated on every run, so it is idempotent.
+python3 "$DROPLET/render_config.py" preamble --upstream "$SB/preamble.md" --section "$DROPLET/preamble-droplet.md" \
+	--out "$SB/preamble.droplet.md"
+chmod 0644 "$SB/preamble.droplet.md"
 
 say "python environment"
 [[ -x "$VENV/bin/python3" ]] || python3 -m venv --system-site-packages "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q "docker>=7" paramiko cryptography
 if [[ "$ORCHESTRATOR_TOOLS" == true ]]; then "$VENV/bin/pip" install -q mcp; fi
-chmod 0755 "$DROPLET" "$DROPLET"/*.py "$DROPLET"/*.sh "$DROPLET/pre-push"
+chmod 0755 "$DROPLET" "$DROPLET"/*.py "$DROPLET"/*.sh "$DROPLET/pre-push" "$DROPLET/hooks" "$DROPLET"/hooks/*
 
 say "bw1-decomp clone ($REPO_SOURCE)"
 # The sandbox's host clone. Remotes: `upstream` = UPSTREAM_REPO (fetch; push DISABLED), `fork` = FORK_REPO
@@ -320,6 +325,8 @@ if [[ "$ORCHESTRATOR_TOOLS" == true ]]; then
 		as sandbox bash -c "curl -fsSL https://claude.ai/install.sh | bash -s '$CLAUDE_VERSION'"
 	fi
 	install -m 0755 "$DROPLET/bw1-orchestrator.sh" /usr/local/bin/bw1-orchestrator
+	# Host-side Claude compacts at 42% of its context window too (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE; self-checked).
+	as sandbox python3 "$DROPLET/render_config.py" claude-settings --file "$SB_HOME/.claude/settings.json"
 fi
 cat >/usr/local/bin/bw1-sandbox <<EOF
 #!/bin/sh
