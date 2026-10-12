@@ -246,6 +246,49 @@ class InstallTests(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("tamper-path", p.stdout + p.stderr)
 
+    @unittest.skipUnless(shutil.which("sh") or shutil.which("bash"), "git hooks need sh")
+    def test_pre_commit_extern_check_of_a_merge_is_against_what_it_merges(self):
+        # pr431m2 (2026-10-12): upstream main's own externs were counted as added by the merge (diff against HEAD)
+        self.assertEqual(self.install().returncode, 0)
+        env = self.shim_env()
+        base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "-q", "-b", "up", env=env)
+        (self.repo / "src/Dance.h").write_text("#pragma once\nextern int DanceShapes[4];\n")
+        (self.repo / "src/Thing.cpp").write_text('#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tint up = 1;\n}\n')
+        git(self.repo, "add", "-A", env=env)
+        git(self.repo, "commit", "-qm", "upstream with an extern", "--no-verify", env=env)
+        git(self.repo, "checkout", "-q", "-b", "case", base, env=env)
+        (self.repo / "src/Thing.cpp").write_text('#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tint mine = 2;\n}\n')
+        git(self.repo, "add", "-A", env=env)
+        git(self.repo, "commit", "-qm", "case", "--no-verify", env=env)
+        case = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        def merge(extra=None):
+            git(self.repo, "reset", "-q", "--hard", case, env=env)
+            self.assertNotEqual(git(self.repo, "merge", "--no-edit", "up", env=env, check=False).returncode, 0)
+            (self.repo / "src/Thing.cpp").write_text('#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tint up = 1;\n'
+                                                     '\tint mine = 2;\n}\n')
+            if extra:
+                (self.repo / extra[0]).write_text(extra[1])
+            git(self.repo, "add", "-A", env=env)
+            return git(self.repo, "commit", "--no-edit", env=env, check=False)
+
+        p = merge()  # upstream's extern comes with the merge: not the merge's own
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(git(self.repo, "rev-list", "--parents", "-1", "HEAD").stdout.split()), 3)
+        p = merge(("src/Mine.h", "#pragma once\nextern int Mine;\n"))  # a new extern in the merge: refused
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("adds extern: extern int Mine;", p.stderr)
+        self.assertNotIn("DanceShapes", p.stderr)
+        git(self.repo, "merge", "--abort", env=env, check=False)
+        # a normal commit is still checked against HEAD: an added extern is refused
+        git(self.repo, "reset", "-q", "--hard", case, env=env)
+        (self.repo / "src/Mine.h").write_text("#pragma once\nextern int Mine;\n")
+        git(self.repo, "add", "-A", env=env)
+        p = git(self.repo, "commit", "-qm", "normal extern", env=env, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("adds extern: extern int Mine;", p.stderr)
+
     def test_stop_hook_blocks_once(self):
         self.assertEqual(self.install().returncode, 0)
         base = git(self.repo, "rev-parse", "HEAD").stdout.strip()

@@ -4,7 +4,8 @@ and a use that can't be declared yet is commented out with a TODO).
 
   no_extern.py              Claude Code PreToolUse hook (JSON on stdin): blocks an Edit/Write/MultiEdit that adds
                             `extern` to a C/C++ file (exit 2)
-  no_extern.py pre-commit   git pre-commit check: refuses a commit whose staged C/C++ lines add `extern`
+  no_extern.py pre-commit   git pre-commit check: refuses a commit whose staged C/C++ lines add `extern`; a merge
+                            commit is checked against the merged-in side (MERGE_HEAD), so upstream's own externs pass
 
 Comment lines don't count. The publisher refuses such a branch as the last guard.
 """
@@ -30,9 +31,17 @@ def uses(text):
     return n
 
 
+def merge_head():
+    p = subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
 def pre_commit():
-    diff = subprocess.run(["git", "diff", "--cached", "-U0", "--no-color", "--"] + ["*" + s for s in SOURCES],
-                          capture_output=True, text=True).stdout
+    # A merge commit is checked against the merged-in side (MERGE_HEAD), as the pre-commit's quality gate is: the
+    # externs that side already has are not the merge's own (pr431m2: main's own externs, 2026-10-12)
+    base = merge_head()
+    diff = subprocess.run(["git", "diff", "--cached", "-U0", "--no-color"] + ([base] if base else [])
+                          + ["--"] + ["*" + s for s in SOURCES], capture_output=True, text=True).stdout
     added = [l[1:].strip() for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
     bad = [l for l in added if uses(l)]
     if bad:
