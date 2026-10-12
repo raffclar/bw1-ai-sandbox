@@ -24,7 +24,10 @@ Roles
                     (default 4) and DISCHARGE_MEMORY (default 5g) so running workers are never starved: base tree +
                     setup + `ninja baseline`; the case's start (measured once per start, then cached) and the head,
                     each with tools/ and configure.py overlaid from the base, objects deleted, `ninja all_source` and
-                    decomp-regress.py --refresh (--fail-on-regression for the head). Then PROGRESS: each of the case's
+                    decomp-regress.py --refresh (its exit code is only recorded). REGRESSIONS are judged on the
+                    host from the three reports: no unit outside the case worse at the head than at the base unless
+                    the start already was (config the user merged into the start), and none worse than at the
+                    start. Then PROGRESS: each of the case's
                     units at or above its start (matched functions, matched code, fuzzy and every section's score)
                     and its triage floor (--floor UNIT=N matched functions), and at least one target function (the
                     case's functions, else any function of its units) scoring higher than at the start. A Chief floor
@@ -359,7 +362,10 @@ class PristineVerifier:
         if start and steps.get("start") == 0 and (workdir / "start-report.json").is_file():
             (workdir / "start-report.sha").write_text(start + "\n")
         detail = f"exit {code}; steps {steps or 'unknown'}; log {workdir / 'verify.log'}"
-        return code == 0 and steps.get("regress") == 0, detail
+        # The builds decide this item; regressions are judged on the host from the three reports (regressions()),
+        # because decomp-regress compares with the base only and so also flags what the case's start already
+        # changed (e.g. config the user merged into the start). Its exit code stays in verify.json and the log.
+        return steps.get("baseline") == 0 and steps.get("head_build") == 0, detail
 
 
 def cached_start(workdir: Path) -> str:
@@ -427,6 +433,48 @@ def floor_overrides(overrides, unit: str) -> dict:
         if o.get("unit") == unit:
             out[o.get("metric")] = o
     return out
+
+
+def is_case_unit(name: str, units) -> bool:
+    return any(name == u or name.rsplit("/", 1)[-1] == u for u in units or [])
+
+
+def worse_metrics(a: dict, b: dict) -> set:
+    """The metrics (matched_functions, matched_code, fuzzy, section:<name>) on which unit b is below unit a."""
+    sa, sb = unit_scores(a), unit_scores(b)
+    out = set()
+    for k in ["matched_functions", "matched_code", "fuzzy"] + [k for k in sa if k.startswith("section:")]:
+        if k in sa and sb.get(k, 0) < sa[k] - (0 if k in INT_METRICS else EPS):
+            out.add(k)
+    return out
+
+
+def regressions(base_report, start_report, head_report, case_units=()) -> list:
+    """No regression against the base beyond what the case's start already had, and none from start to head:
+    a unit outside the case may not be worse at the head than at the base on any metric on which the start was not
+    already worse, nor worse than at the start; a unit present at the start may not be gone at the head. The
+    case's own units are judged by progress() (the start and the Chief's accepted floors)."""
+    if base_report is None or head_report is None or start_report is None:
+        return ["missing a report (base, start or head) to judge regressions with"]
+    B = {u["name"]: u for u in base_report.get("units", [])}
+    S = {u["name"]: u for u in start_report.get("units", [])}
+    H = {u["name"]: u for u in head_report.get("units", [])}
+    problems = []
+    for name in sorted(set(B) | set(S)):
+        if is_case_unit(name, case_units):
+            continue
+        if name not in H:
+            if name in S:
+                problems.append(f"{name}: removed at the head")
+            continue
+        new = set()
+        if name in B:
+            new |= worse_metrics(B[name], H[name]) - (worse_metrics(B[name], S[name]) if name in S else set())
+        if name in S:
+            new |= worse_metrics(S[name], H[name])
+        if new:
+            problems.append(f"{name}: worse at the head ({', '.join(sorted(new))})")
+    return problems
 
 
 def function_targets(names, function: str) -> bool:
@@ -1003,13 +1051,19 @@ class Hospital:
             start_report = load_report(workdir / ("base-report.json" if start == c["base"] else "start-report.json"))
             if start != c["base"] and cached_start(workdir) != start:
                 start_report = None
-            pproblems, record = progress(c, start_report, load_report(workdir / "head-report.json"),
+            head_report = load_report(workdir / "head-report.json")
+            item("regress", "No regression against the base beyond the start's, none from start to head",
+                 regressions(load_report(workdir / "base-report.json"), start_report, head_report,
+                             c.get("units") or []))
+            pproblems, record = progress(c, start_report, head_report,
                                          self.chief(cid).get("floor_overrides") or [])
             item("progress", "Progress: units at or above the start and floor, a target function improved",
                  pproblems)
             if record.get("units") and not c.get("baseline"):
                 c["baseline"] = {"start": start, **{u: v["start"] for u, v in record["units"].items()}}
         else:
+            item("regress", "No regression against the base beyond the start's, none from start to head", [],
+                 skipped=True)
             item("progress", "Progress: units at or above the start and floor, a target function improved", [],
                  skipped=True)
         passed = all(i["ok"] for i in items)

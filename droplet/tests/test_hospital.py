@@ -568,7 +568,7 @@ class HospitalTests(unittest.TestCase):
                 self.code = code
 
             def wait(self, timeout):
-                (work / "verify.json").write_text(json.dumps({"baseline": 0, "head_build": 0, "regress": self.code}))
+                (work / "verify.json").write_text(json.dumps({"baseline": 0, "head_build": self.code, "regress": 0}))
                 return {"StatusCode": self.code}
 
             def logs(self, **k):
@@ -776,6 +776,41 @@ class HospitalTests(unittest.TestCase):
         self.assertFalse((self.cases / "pr431-incl").exists())
         with self.assertRaises(H.HospitalError):
             self.hosp.queue("pr431-incl", "again")
+
+    def other(self, rep, name, matched, sections=None):
+        rep["units"].append({"name": name, "measures": {"fuzzy_match_percent": float(matched),
+                                                        "matched_functions": matched, "matched_code": str(matched)},
+                             "sections": [{"name": ".text", "fuzzy_match_percent": float(matched)}],
+                             "functions": []})
+
+    def test_regressions_beyond_the_start_send_the_case_back(self):
+        self.triage()
+        for k in ("base", "start"):
+            self.other(self.reports[k], "runblack/Black/Other", 10)
+        self.other(self.reports["head"], "runblack/Black/Other", 9)
+        out = []
+        while not (self.cases / "pr431/discharge.json").exists() and len(out) < 12:
+            out.append(self.hosp.advance("pr431"))
+        d = json.loads((self.cases / "pr431/discharge.json").read_text())
+        items = {i["key"]: i for i in d["items"]}
+        self.assertFalse(items["regress"]["ok"])
+        self.assertIn("runblack/Black/Other: worse at the head", items["regress"]["problems"][0])
+        self.assertEqual(self.hosp.load("pr431")["stage"], "treatment", "\n".join(out))
+
+    def test_what_the_start_already_changed_is_not_a_regression(self):
+        self.triage()
+        # a gap unit the start's merged config split away, and a unit the start already lowered
+        self.other(self.reports["base"], "runblack/fn_0083F270", 1)
+        self.other(self.reports["base"], "runblack/Black/Merged", 10)
+        self.other(self.reports["start"], "runblack/Black/Merged", 8)
+        self.other(self.reports["head"], "runblack/Black/Merged", 8)
+        out = self.run_until_closed()
+        self.assertEqual(self.hosp.load("pr431")["stage"], "discharged", "\n".join(out))
+        d = json.loads((self.cases / "pr431/discharge.json").read_text())
+        self.assertTrue({i["key"]: i for i in d["items"]}["regress"]["ok"])
+        # but a unit the head drops that the start still had is a regression
+        gone = H.regressions(self.reports["base"], self.reports["base"], self.reports["start"], ["Thing"])
+        self.assertIn("runblack/fn_0083F270: removed at the head", gone)
 
     def test_progress_function_matching(self):
         self.assertTrue(H.function_targets(["Thing::Real"], "?Real@Thing@@QAEXXZ"))
