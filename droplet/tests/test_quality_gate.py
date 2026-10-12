@@ -70,6 +70,91 @@ class GateTests(unittest.TestCase):
         cpp = '#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tfloat p = q * 13.82f;\n}\n'
         self.assertEqual(self.rules({"src/Thing.cpp": cpp}), [("magic-float", "warn")])
 
+    def fresh(self):
+        self.tearDown()
+        self.setUp()
+
+    def body(self, text):
+        return '#include "Thing.h"\n\nvoid Thing::Real()\n{\n' + text + "}\n"
+
+    def test_define_continuations_are_preprocessor(self):
+        # A multi-line #define after the first function is neither a mid-file declaration nor a helper definition
+        cpp = self.body("\tint a = 1;\n") + "\n#define SWAP(a, b) \\\n\t{ \\\n\t\tint t = a; \\\n\t\ta = b; \\\n" \
+                                            "\t\tb = t; \\\n\t}\n"
+        self.assertEqual(self.rules({"src/Thing.cpp": cpp}), [])
+
+    def test_one_sided_if_clamp_is_a_warning(self):
+        got = self.rules({"src/Thing.cpp": self.body("\tif (x < lo)\n\t\tx = lo;\n\tUse(x);\n")})
+        self.assertEqual(got, [("clamp-if", "warn")])
+
+    def test_two_sided_if_clamp_is_hard(self):
+        for second in ("\telse if (x > hi)\n\t\tx = hi;\n", "\tif (x > hi)\n\t\tx = hi;\n"):
+            got = self.rules({"src/Thing.cpp": self.body("\tif (x < lo)\n\t\tx = lo;\n" + second)})
+            self.assertEqual(got, [("clamp", "hard")], second)
+
+    def test_anti_cheat_constructs(self):
+        cases = {
+            "inline-asm": "\t__asm\n\t{\n\t\tmov eax, 1\n\t}\n",
+            "emit": "\t_asm _emit 0x90\n",
+            "byte-code": "\t((void (*)())Code)();\n",
+        }
+        for rule, text in cases.items():
+            self.fresh()
+            cpp = '#include "Thing.h"\n\nstatic unsigned char Code[] = {0x90, 0xc3};\n\nvoid Thing::Real()\n{\n' + \
+                  text + "}\n"
+            self.assertIn((rule, "hard"), self.rules({"src/Thing.cpp": cpp}), rule)
+        self.fresh()
+        got = self.rules({"src/Thing.cpp": self.body('\t((int (__cdecl *)(void))"\\x33\\xc0\\xc3")();\n')})
+        self.assertIn(("byte-code", "hard"), got)
+        for pragma in ('#pragma code_seg(".text$a")', '#pragma comment(linker, "/merge:.rdata=.text")',
+                       "#pragma alloc_text(x, Real)"):
+            self.fresh()
+            got = self.rules({"src/Thing.cpp": pragma + "\n" + self.body("")})
+            self.assertIn(("pragma-section", "hard"), got, pragma)
+
+    def test_optimisation_pragmas_new_to_the_tree_are_warnings(self):
+        self.write({"src/Old.cpp": "#pragma inline_depth(2)\n"})
+        self.base = self.commit()
+        self.assertEqual(self.rules({"src/Thing.cpp": "#pragma inline_depth(2)\n" + self.body("")}), [])
+        self.assertEqual(self.rules({"src/Thing.cpp": "#pragma optimize(\"g\", off)\n" + self.body("")}),
+                         [("pragma-opt", "warn")])
+
+    def test_tamper_paths_are_hard_and_escalate(self):
+        for path in ("config/BW1W120/symbols.txt", "tools/decomp-diff.py", "configure.py", "objdiff.json",
+                     "build.ninja", "build/BW1W120/src/x.o", "AGENTS.md", ".claude/settings.json", ".clang-format",
+                     ".github/workflows/build.yml"):
+            self.fresh()
+            self.write({path: "changed\n"})
+            head = self.commit()
+            found = Q.run(str(self.t), self.base, head)
+            self.assertEqual([(f.rule, f.path) for f in found], [("tamper-path", path)], path)
+            self.assertEqual(Q.summary(found)["escalate"], [f"tamper-path: {path}"])
+        self.fresh()
+        self.write({"tools/matching_ledger.jsonl": "{}\n"})  # the ledger is data, not a tool
+        self.assertEqual(Q.run(str(self.t), self.base, self.commit()), [])
+
+    def test_allow_paths_from_a_revision_and_by_name(self):
+        self.write({"config/BW1W120/symbols.txt": SYMBOLS + "merged = .text:0x1;\n"})
+        start = self.commit()  # e.g. the case's starting point, whose data change the user merged
+        self.write({"src/Thing.cpp": self.body("\tint a = 2;\n")})
+        head = self.commit()
+        self.assertEqual([f.rule for f in Q.run(str(self.t), self.base, head)], ["tamper-path"])
+        self.assertEqual(Q.run(str(self.t), self.base, head, allow_from=start), [])
+        self.write({"config/BW1W120/symbols.txt": SYMBOLS + "merged = .text:0x2;\n"})  # changed again after start
+        head2 = self.commit()
+        self.assertEqual([f.rule for f in Q.run(str(self.t), self.base, head2, allow_from=start)], ["tamper-path"])
+        self.assertEqual(Q.run(str(self.t), self.base, head2, allow_from=start,
+                               allow_paths=["config/BW1W120/symbols.txt"]), [])
+
+    def test_staged_mode_blocks_tamper_and_cheats(self):
+        self.write({"tools/decomp-diff.py": "x\n"})
+        git(self.t, "add", "-A")
+        self.assertEqual(Q.main(["--repo", str(self.t), "--staged"]), 1)
+        git(self.t, "reset", "-q", "--hard")
+        self.write({"src/Thing.cpp": self.body("\tint a = 3;\n")})
+        git(self.t, "add", "-A")
+        self.assertEqual(Q.main(["--repo", str(self.t), "--staged"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
