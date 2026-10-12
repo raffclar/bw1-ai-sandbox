@@ -188,6 +188,22 @@ class InstallTests(unittest.TestCase):
         self.assertIn("inline-asm", p.stdout + p.stderr)
         p = commit("src/Thing.cpp", '#include "Thing.h"\n\nvoid Thing::Real()\n{\n\tint a = 1;\n}\n')
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        # a file that had inline asm at the case's base (~/case/gate-base) may gain more; a later commit that slipped
+        # asm into another file (--no-verify) does not make that file an asm file
+        case_base = git(self.repo, "rev-parse", "HEAD", env=env).stdout.strip()
+        (self.home / "case").mkdir(exist_ok=True)
+        (self.home / "case/gate-base").write_text(case_base + "\n")
+        p = commit("src/CPUCheck.cpp", "void P()\n{\n\t__asm cpuid\n}\n")
+        self.assertNotEqual(p.returncode, 0)  # a new file with asm: hard
+        (self.repo / "src/CPUCheck.cpp").write_text("void P()\n{\n\t__asm cpuid\n}\n")
+        git(self.repo, "add", "-A", env=env)
+        git(self.repo, "commit", "-qm", "asm without the hook", "--no-verify", env=env)
+        p = commit("src/CPUCheck.cpp", "void P()\n{\n\t__asm cpuid\n\t__asm nop\n}\n")
+        self.assertNotEqual(p.returncode, 0, "HEAD has asm there, but the case's base does not")
+        (self.home / "case/gate-base").write_text(git(self.repo, "rev-parse", "HEAD", env=env).stdout.strip() + "\n")
+        p = commit("src/CPUCheck.cpp", "void P()\n{\n\t__asm cpuid\n\t__asm nop\n}\n")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("inline-asm-existing", p.stdout + p.stderr)
 
     def test_stop_hook_blocks_once(self):
         self.assertEqual(self.install().returncode, 0)

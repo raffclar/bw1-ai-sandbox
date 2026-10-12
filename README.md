@@ -288,9 +288,10 @@ anyone's comments.
 ## Quality gate, hooks and the hospital
 
 **The gate** (`droplet/quality_gate.py`) checks the lines a change adds against bwrsandman's review rules from
-PR #431 and AGENTS.md, plus anti-cheat rules: inline assembly, `_emit`, section and linker pragmas, bytes cast to
-functions, and any change to protected paths (build files, `config/**`, `tools/**`, the agent rules and hooks),
-which also escalates to the Chief. It reads git objects only. It runs in three places: as each worker's git
+PR #431 and AGENTS.md, plus anti-cheat rules: inline assembly (allowed only in files that already have it at the
+case's base, such as CPUCheck.cpp, and then reported as a warning; `__declspec(naked)` never), `_emit`, section and
+linker pragmas, bytes cast to functions, and any change to protected paths (build files, `config/**`, all of
+`tools/**` including `tools/matching_ledger.jsonl`, the agent rules and hooks), which also escalates to the Chief. It reads git objects only. It runs in three places: as each worker's git
 pre-commit hook (`--staged`), as the workers' Claude Stop hook (blocks once), and on the host in the Discharge Nurse
 and the publisher.
 
@@ -310,16 +311,22 @@ python3 /opt/bw1-sandbox/droplet/hooks/install_hooks.py --home /srv/decomp/worke
 **The hospital** (`bw1-hospital`, i.e. `droplet/hospital.py`; see its docstring) takes one change through triage,
 the Fellow's workup (a plan, no code), a plan review by a new Attending worker, treatment, a code review by another
 new Attending, and the deterministic Discharge Nurse, whose pristine build runs in a `--network none` container with
-the base's `tools/` and `configure.py`. Cases live in `/var/lib/bw1-sandbox/cases/<id>/`. The Chief (you, as root)
+the base's `tools/` and `configure.py`, capped at 4 CPUs and 5g (half the droplet's 8 vCPUs; two 4g workers, the
+host and Ghidra keep the rest of its 16 GB; `DISCHARGE_CPUS`/`DISCHARGE_MEMORY` in `/etc/bw1-sandbox/hospital.env`).
+Discharge needs progress as well as no regression: each of the case's units at or above its score at the case's
+start (measured once in the same container) and its triage floor (`--floor UNIT=N`), and at least one target
+function scoring higher than at the start. Without progress the case escalates to the Chief. Cases live in `/var/lib/bw1-sandbox/cases/<id>/`. The Chief (you, as root)
 handles escalations (`bw1-hospital status`), the precedent log every prompt includes (`bw1-hospital precedent`),
 releases of held cases (`release`), protected-path approvals (`allow-paths`) and `resolve`. The charge timer
 (`bw1-hospital-charge.timer`) advances open cases every 15 minutes; setup installs it disabled.
 
-Limit: upstream mounts every worker folder read-only at `/peers` in every worker, so only its instructions keep an
-Attending out of the Fellow's transcript (`/peers/<fellow>/home/agent.jsonl`).
+**Attending isolation:** upstream mounts every worker folder read-only at `/peers`. `sandbox_droplet.py` patches the
+launch so a worker named `att-<case>-<n>` gets only `/peers/<fellow>/repo` (read-only), on every path that starts
+it (spawn, resume, autoresume, portal): never the Fellow's home and transcript, nor any other worker. If its case
+can't be read, it gets no peers at all.
 
 **Tamper protection:** setup writes `/etc/bw1-sandbox/integrity.json` (root-owned) with the hashes of the gate,
-`hospital.py`, `integrity.py`, the publisher, the hooks and the hospital's prompts. The publisher and the Discharge
+`hospital.py`, `integrity.py`, the publisher, `sandbox_droplet.py`, the hooks and the hospital's prompts. The publisher and the Discharge
 Nurse refuse on any mismatch, and the Discharge Nurse also compares the Fellow's installed hooks. After changing
 any of those files, re-run `python3 /opt/bw1-sandbox/droplet/integrity.py write` as root.
 
@@ -458,7 +465,9 @@ python3 droplet/tests/test_ghidra.py -v                               # offline 
 
 ## Stopping and tearing down
 
-* **Pause publishing:** `touch /etc/bw1-sandbox/STOP`. The publisher stops.
+* **Pause publishing only:** `touch /etc/bw1-sandbox/STOP-PUBLISH`. The publisher stops; the hospital keeps
+  running its stages.
+* **Pause publishing and the hospital:** `touch /etc/bw1-sandbox/STOP`.
 * **Pause workers:** `bw1-sandbox pause NAME`, or `stop NAME`.
 * **Stop everything:** `terraform output stop_command`. It creates the stop file, disables the timers, autoresume
   and the portal, and stops all worker containers.

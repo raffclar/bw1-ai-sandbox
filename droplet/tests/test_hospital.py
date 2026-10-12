@@ -30,6 +30,17 @@ def git(repo, *a):
     return subprocess.run([*G, "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout.strip()
 
 
+def report(matched=157, total=161, real=100.0, other=50.0, text=97.0, unit="runblack/Black/Thing"):
+    """An objdiff report (the parts the progress check reads) with one unit and two functions."""
+    return {"measures": {}, "units": [{
+        "name": unit,
+        "measures": {"fuzzy_match_percent": text, "matched_functions": matched, "total_functions": total,
+                     "matched_code": str(matched * 10), "total_code": str(total * 10)},
+        "sections": [{"name": ".data", "fuzzy_match_percent": 100.0}, {"name": ".text", "fuzzy_match_percent": text}],
+        "functions": [{"name": "?Real@Thing@@QAEXXZ", "fuzzy_match_percent": real},
+                      {"name": "?Other@Thing@@QAEXXZ", "fuzzy_match_percent": other}]}]}
+
+
 def review(verdict, head, blocking=(), resolved=(), drop=()):
     secs = {s: "None." for s in H.REVIEW_SECTIONS}
     secs["Checks"] = "| Check | Result | Evidence |\n|---|---|---|\n| gate | pass | 0 hard |"
@@ -131,6 +142,9 @@ class HospitalTests(unittest.TestCase):
         self.manifest.write_text(json.dumps(integrity.build(DROPLET)))
         self.verify_calls = []
         self.verify_result = (True, "verified")
+        # the reports the fake container leaves: the start at 157/161, the head improving Thing::Other
+        self.reports = {"base": report(matched=10, real=40.0, other=0.0, text=20.0), "start": report(),
+                        "head": report(other=80.0, text=98.0)}
         self.hosp = H.Hospital(self.ward, cases=self.cases, manifest=self.manifest, verifier=self.verifier,
                                stop_file=self.t / "STOP", root=False, require_root_files=False)
         self.hosp.format_problems = lambda *a: []
@@ -149,8 +163,15 @@ class HospitalTests(unittest.TestCase):
         git(self.repo, "commit", "-qm", msg)
         return git(self.repo, "rev-parse", "HEAD")
 
-    def verifier(self, base, head, workdir):
+    def verifier(self, base, head, workdir, start=""):
         self.verify_calls.append((base, head))
+        workdir = Path(workdir)
+        (workdir / "base-report.json").write_text(json.dumps(self.reports["base"]))
+        if start and start != base and H.cached_start(workdir) != start:
+            self.start_builds = getattr(self, "start_builds", 0) + 1
+            (workdir / "start-report.json").write_text(json.dumps(self.reports["start"]))
+            (workdir / "start-report.sha").write_text(start + "\n")
+        (workdir / "head-report.json").write_text(json.dumps(self.reports["head"]))
         return self.verify_result
 
     def script_happy(self):
@@ -169,7 +190,8 @@ class HospitalTests(unittest.TestCase):
         w.on = {"workup": workup, "treatment": treatment, "plan": attending, "code": attending}
 
     def triage(self, **kw):
-        args = dict(cid="pr431", fellow="first", brief="bwr's 13 comments", start=self.start, hold=True)
+        args = dict(cid="pr431", fellow="first", brief="bwr's 13 comments", start=self.start, hold=True,
+                    units=["Thing"])
         args.update(kw)
         return self.hosp.triage(args.pop("cid"), args.pop("fellow"), args.pop("brief"), **args)
 
@@ -524,6 +546,188 @@ class HospitalTests(unittest.TestCase):
         self.triage(cid="other")
         out = self.hosp.charge()
         self.assertEqual(len(out), 2)
+
+
+    # --- progress (the Chief, 2026-10-12: discharge needs progress, else the Chief decides) ----------------
+
+    def test_discharge_records_progress_and_measures_the_start_once(self):
+        self.triage(floors={"Thing": 157})
+        out = self.run_until_closed()
+        c = self.hosp.load("pr431")
+        self.assertEqual(c["stage"], "discharged", "\n".join(out))
+        d = json.loads((self.cases / "pr431/discharge.json").read_text())
+        items = {i["key"]: i for i in d["items"]}
+        self.assertTrue(items["progress"]["ok"], items["progress"])
+        self.assertEqual(d["progress"]["units"]["Thing"]["start"]["matched_functions"], 157)
+        self.assertEqual(d["progress"]["improved"], ["Thing: ?Other@Thing@@QAEXXZ 50.00% -> 80.00%"])
+        self.assertEqual(c["baseline"]["Thing"]["matched_functions"], 157)
+        self.assertEqual(c["baseline"]["start"], self.start)
+        md = (self.cases / "pr431/checklist.md").read_text()
+        self.assertIn("157/161 -> 157/161", md)
+        self.assertIn("Floor (matched functions): Thing >= 157", (self.cases / "pr431/case.md").read_text()
+                      .replace("Progress floor (matched functions)", "Floor (matched functions)"))
+        self.assertEqual(self.start_builds, 1)
+        # a second discharge at the same start reuses the cached start report
+        c["stage"] = "discharge"
+        self.hosp.discharge_case(c)
+        self.assertEqual(self.start_builds, 1)
+
+    def assert_no_progress_escalates(self, why):
+        out = self.run_until_closed()
+        c = self.hosp.load("pr431")
+        self.assertEqual(c["stage"], "escalated", "\n".join(out))
+        self.assertIn("no progress", c["escalations"][-1]["why"])
+        self.assertEqual(c["rounds"], 0)  # straight to the Chief, not back to treatment
+        d = json.loads((self.cases / "pr431/discharge.json").read_text())
+        items = {i["key"]: i for i in d["items"]}
+        self.assertFalse(d["passed"])
+        self.assertTrue(items["verify"]["ok"])
+        self.assertTrue(any(why in p for p in items["progress"]["problems"]), items["progress"]["problems"])
+
+    def test_no_improved_function_escalates(self):
+        self.triage()
+        self.reports["head"] = report()  # same as the start
+        self.assert_no_progress_escalates("no target function improved")
+
+    def test_a_unit_below_its_start_escalates(self):
+        self.triage()
+        self.reports["head"] = report(matched=156, other=90.0)  # one function better, one match lost
+        self.assert_no_progress_escalates("matched functions 156 < 157")
+
+    def test_a_lower_text_score_escalates(self):
+        self.triage()
+        self.reports["head"] = report(other=80.0, text=96.0)
+        self.assert_no_progress_escalates(".text score")
+
+    def test_a_unit_below_its_floor_escalates(self):
+        self.triage(floors={"Thing": 158})
+        self.assert_no_progress_escalates("below the triage floor 158")
+
+    def test_named_target_functions_must_improve(self):
+        self.triage(functions=["Thing::Real"])  # Other improves, Real does not
+        self.assert_no_progress_escalates("improved from the start (functions Thing::Real)")
+
+    def test_a_case_without_units_cannot_discharge(self):
+        self.triage(units=[])
+        self.assert_no_progress_escalates("lists no units")
+
+    def test_progress_function_matching(self):
+        self.assertTrue(H.function_targets(["Thing::Real"], "?Real@Thing@@QAEXXZ"))
+        self.assertTrue(H.function_targets(["Outer::Thing::Real"], "?Real@Thing@Outer@@QAEXXZ"))
+        self.assertFalse(H.function_targets(["Thing::Real"], "?Really@Thing@@QAEXXZ"))
+        self.assertTrue(H.function_targets(["CFunc"], "_CFunc"))
+        self.assertTrue(H.function_targets(["Free"], "?Free@@YAXXZ"))
+
+    def test_pristine_verifier_is_capped_and_measures_the_start(self):
+        work = self.t / "work"
+        work.mkdir()
+        v = H.PristineVerifier(docker=None, repo=self.repo, setup=[])
+        args = v.container_args(work)
+        self.assertEqual(args["nano_cpus"], 4 * 10 ** 9)
+        self.assertEqual((args["mem_limit"], args["memswap_limit"]), ("5g", "5g"))
+        v2 = H.PristineVerifier(docker=None, repo=self.repo, setup=[], cpus=2.5, memory="3g")
+        self.assertEqual(v2.container_args(work)["nano_cpus"], 2_500_000_000)
+        v.prepare(self.base, self.start, work, start=self.old)
+        self.assertTrue((work / "start/src/Old.cpp").is_file())
+        self.assertEqual((work / "start/tools/decomp-diff.py").read_text(), "print('base tool')\n")
+        v.prepare(self.base, self.start, work)
+        self.assertFalse((work / "start").exists())
+        sh = (DROPLET / "hospital/verify.sh").read_text()
+        for want in ("/work/base-report.json", "/work/start-report.json", "/work/head-report.json",
+                     "--fail-on-regression"):
+            self.assertIn(want, sh)
+
+
+class AttendingIsolationTests(unittest.TestCase):
+    """sandbox_droplet.patch on a fake bw1-ai-sandbox: an Attending's container gets only /peers/<fellow>/repo."""
+
+    def setUp(self):
+        import sandbox_droplet
+        self.SD = sandbox_droplet
+        self.t = Path(tempfile.mkdtemp(prefix="isotest-"))
+        (self.t / "pr431").mkdir()
+        (self.t / "pr431/case.json").write_text(json.dumps({"id": "pr431", "fellow": "first"}))
+        self.old_cases, sandbox_droplet.CASES = sandbox_droplet.CASES, self.t
+        self.runs = []
+        runs = self.runs
+
+        class Containers:
+            def run(self, image, **kw):
+                runs.append(kw)
+
+            def list(self, **kw):
+                return []
+
+        class Docker:
+            containers = Containers()
+
+        class SandboxError(Exception):
+            pass
+
+        class Sandbox:  # the upstream shape: _launch mounts WORKERS at /peers through the docker property
+            @property
+            def docker(self):
+                return Docker()
+
+            def _launch(self, name, prompt, model, effort, resume, mode=""):
+                w = f"/srv/decomp/workers/{name}"
+                self.docker.containers.run("bw1-worker", name=f"w-{name}", volumes={
+                    f"{w}/repo": {"bind": "/work", "mode": "rw"},
+                    f"{w}/home": {"bind": "/home/agent", "mode": "rw"},
+                    "/srv/decomp/workers": {"bind": "/peers", "mode": "ro"},
+                    "/srv/decomp/shared/data": {"bind": "/opt/orig", "mode": "ro"}})
+                return "ok"
+
+            def spawn(self, name, prompt, model="", effort=""):
+                return self._launch(name, prompt, model, effort, resume=False)
+
+            def resume(self, name, prompt, model="", effort="", mode=""):
+                return self._launch(name, prompt, model, effort, resume=True, mode=mode)
+
+        class Mod:
+            pass
+
+        self.mod = Mod()
+        self.mod.Sandbox, self.mod.SandboxError, self.mod.WORKERS = Sandbox, SandboxError, "/srv/decomp/workers"
+        sandbox_droplet.patch(self.mod)
+        sandbox_droplet.patch(self.mod)  # idempotent: patching twice must not wrap twice
+        self.sb = Sandbox()
+
+    def tearDown(self):
+        self.SD.CASES = self.old_cases
+        shutil.rmtree(self.t, ignore_errors=True)
+
+    def peers(self):
+        return {k: v for k, v in self.runs[-1]["volumes"].items() if v["bind"].startswith("/peers")}
+
+    def test_attending_sees_only_the_fellows_repo(self):
+        for call in (lambda: self.sb.spawn("att-pr431-1", "review"),
+                     lambda: self.sb.resume("att-pr431-1", "go on", mode="auto")):  # e.g. autoresume
+            call()
+            self.assertEqual(self.peers(), {"/srv/decomp/workers/first/repo": {"bind": "/peers/first/repo",
+                                                                               "mode": "ro"}})
+            vols = self.runs[-1]["volumes"]
+            self.assertNotIn("/srv/decomp/workers", vols)
+            self.assertNotIn("/srv/decomp/workers/first/home", vols)
+            self.assertEqual(vols["/srv/decomp/workers/att-pr431-1/home"]["bind"], "/home/agent")  # its own home
+            self.assertIn("/srv/decomp/shared/data", vols)
+
+    def test_other_workers_keep_the_upstream_mounts(self):
+        self.sb.spawn("first", "work")
+        self.assertEqual(self.peers(), {"/srv/decomp/workers": {"bind": "/peers", "mode": "ro"}})
+        self.assertIsNone(getattr(self.sb, "_bw1_peer_scope", None))
+
+    def test_unknown_case_mounts_no_peers(self):
+        self.sb.spawn("att-nocase-1", "review")
+        self.assertEqual(self.peers(), {})
+        (self.t / "pr431/case.json").write_text(json.dumps({"id": "pr431", "fellow": "../../etc"}))
+        self.sb.spawn("att-pr431-2", "review")
+        self.assertEqual(self.peers(), {})
+
+    def test_attending_name_parsing(self):
+        self.assertEqual(self.SD.attending_fellow("att-pr431-12"), (True, "first"))
+        self.assertEqual(self.SD.attending_fellow("att-pr431"), (False, ""))
+        self.assertEqual(self.SD.attending_fellow("first"), (False, ""))
 
 
 class FilesTests(unittest.TestCase):

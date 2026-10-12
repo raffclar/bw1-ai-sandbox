@@ -130,8 +130,46 @@ class GateTests(unittest.TestCase):
             self.assertEqual([(f.rule, f.path) for f in found], [("tamper-path", path)], path)
             self.assertEqual(Q.summary(found)["escalate"], [f"tamper-path: {path}"])
         self.fresh()
-        self.write({"tools/matching_ledger.jsonl": "{}\n"})  # the ledger is data, not a tool
-        self.assertEqual(Q.run(str(self.t), self.base, self.commit()), [])
+        self.write({"tools/matching_ledger.jsonl": "{}\n"})  # no exception: tools/** in full (the Chief, 2026-10-12)
+        found = Q.run(str(self.t), self.base, self.commit())
+        self.assertEqual([(f.rule, f.path, f.level) for f in found],
+                         [("tamper-path", "tools/matching_ledger.jsonl", "hard")])
+
+    def test_inline_asm_only_in_files_that_already_had_it(self):
+        asm_cpp = "void P()\n{\n\t__asm cpuid\n}\n"
+        self.write({"src/CPUCheck.cpp": asm_cpp, "src/Comment.cpp": '// __asm in a comment\nconst char* s = "_asm";\n'})
+        self.base = self.commit()
+        # more asm in a file that had asm at the base: allowed, reported as a warning
+        got = self.rules({"src/CPUCheck.cpp": "void P()\n{\n\t__asm cpuid\n\t_asm mov eax, 1\n\tasm(\"nop\");\n}\n"})
+        self.assertEqual(got, [("inline-asm-existing", "warn")])
+        # a file whose base only mentions asm in a comment or a string is not an asm file; Thing.cpp had none
+        for path in ("src/Comment.cpp", "src/Thing.cpp", "src/New.cpp"):
+            self.fresh()
+            self.write({"src/CPUCheck.cpp": asm_cpp,
+                        "src/Comment.cpp": '// __asm in a comment\nconst char* s = "_asm";\n'})
+            self.base = self.commit()
+            got = self.rules({path: "void Q()\n{\n\t__asm nop\n}\n"})
+            self.assertIn(("inline-asm", "hard"), got, path)
+        # naked, _emit, section pragmas and byte-code stay hard in an asm file too
+        for text, rule in (("__declspec(naked) void N()\n{\n}\n", "inline-asm"),
+                           ("void E()\n{\n\t__asm _emit 0x90\n}\n", "emit"),
+                           ('#pragma code_seg(".x")\n', "pragma-section"),
+                           ("static unsigned char C[] = {0xc3};\nvoid B()\n{\n\t((void (*)())C)();\n}\n",
+                            "byte-code")):
+            self.fresh()
+            self.write({"src/CPUCheck.cpp": asm_cpp})
+            self.base = self.commit()
+            got = self.rules({"src/CPUCheck.cpp": asm_cpp + text})
+            self.assertIn((rule, "hard"), got, text)
+        # --asm-base: the staged check (whose base is HEAD) takes the case's base for the asm files
+        self.fresh()
+        base = self.base
+        self.write({"src/Thing.cpp": asm_cpp})
+        self.commit()  # a later commit (e.g. the worker's own, made with --no-verify) added asm to Thing.cpp
+        self.write({"src/Thing.cpp": asm_cpp.replace("cpuid", "cpuid\n\t__asm nop")})
+        git(self.t, "add", "-A")
+        self.assertEqual(Q.main(["--repo", str(self.t), "--staged"]), 0)  # HEAD has asm there
+        self.assertEqual(Q.main(["--repo", str(self.t), "--staged", "--asm-base", base]), 1)
 
     def test_allow_paths_from_a_revision_and_by_name(self):
         self.write({"config/BW1W120/symbols.txt": SYMBOLS + "merged = .text:0x1;\n"})

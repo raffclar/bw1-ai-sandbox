@@ -347,11 +347,14 @@ if [[ ! -f "$CASES/precedents.md" ]]; then
 fi
 chown root:root "$CASES/precedents.md"
 chmod 0644 "$CASES/precedents.md"
-printf 'GAME_VERSION=%s\n' "$GAME_VERSION" >"$ETC/hospital.env"
+# The Discharge container's caps: half the droplet's CPUs, and memory that leaves two 4g workers, the host and Ghidra
+# theirs (8 vCPUs / 16 GB droplet). Change them here for another droplet size.
+printf 'GAME_VERSION=%s\nDISCHARGE_CPUS=4\nDISCHARGE_MEMORY=5g\n' "$GAME_VERSION" >"$ETC/hospital.env"
 chmod 0644 "$ETC/hospital.env"
 cat >/usr/local/bin/bw1-hospital <<EOF
 #!/bin/sh
 # The hospital pipeline (droplet/hospital.py): as the sandbox user for cases, as root for the Chief's commands.
+set -a; [ -r $ETC/hospital.env ] && . $ETC/hospital.env; set +a
 exec env SANDBOX_DIR=$SB GAME_VERSION=$GAME_VERSION $VENV/bin/python3 $DROPLET/hospital.py "\$@"
 EOF
 chmod 0755 /usr/local/bin/bw1-hospital

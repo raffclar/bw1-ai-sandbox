@@ -13,21 +13,31 @@ Roles
                     template (verdict, checks, [B#] blocking findings, resolution of prior findings, plan
                     conformance, match verification with a revert check, bwrsandman's 13-rule checklist and the
                     anti-cheat checklist).
-                    LIMIT: /peers is a read-only mount of ALL worker folders (upstream bw1-ai-sandbox mounts it that
-                    way), so an Attending *could* read the Fellow's transcript in /peers/<fellow>/home/agent.jsonl.
-                    Only its instructions forbid it; nothing enforces it. Closing that needs a sandbox change (mount
-                    only /peers/<fellow>/repo for attendings).
+                    Isolation: upstream bw1-ai-sandbox mounts ALL worker folders at /peers. sandbox_droplet.py patches
+                    the launch so a worker named att-<case>-<n> gets only /peers/<fellow>/repo (read-only): never the
+                    Fellow's home (transcript, notes) or any other worker. An unreadable case mounts no peers at all.
   Discharge Nurse   deterministic, no LLM (`discharge`): integrity manifest, approved plan, templates complete, last
                     code review APPROVE on this head with no unresolved [B#], quality gate green (host, git objects
                     only), clang-format 22 clean, clean history (no merges, sandbox snapshots, fixup!/WIP; head ==
                     reviewed head), case delta <= 1000 lines, the worker's hooks match the manifest, and pristine
-                    verification in a throwaway bw1-worker container with --network none: base tree + setup +
-                    `ninja baseline`, then the head with tools/ and configure.py overlaid from the base, objects
-                    deleted, `ninja all_source`, decomp-regress.py --refresh --fail-on-regression. Writes checklist.md
-                    and discharge.json (head, passed), which the publisher requires.
+                    verification in a throwaway bw1-worker container with --network none, capped at DISCHARGE_CPUS
+                    (default 4) and DISCHARGE_MEMORY (default 5g) so running workers are never starved: base tree +
+                    setup + `ninja baseline`; the case's start (measured once per start, then cached) and the head,
+                    each with tools/ and configure.py overlaid from the base, objects deleted, `ninja all_source` and
+                    decomp-regress.py --refresh (--fail-on-regression for the head). Then PROGRESS: each of the case's
+                    units at or above its start (matched functions, matched code, fuzzy and .text score) and its
+                    triage floor (--floor UNIT=N matched functions), and at least one target function (the case's
+                    functions, else any function of its units) scoring higher than at the start. No progress
+                    ESCALATES to the Chief rather than going back to treatment. Writes checklist.md and
+                    discharge.json (head, passed), which the publisher requires.
   Chief             the user, as root: `status` lists escalations; `precedent` appends to the root-owned precedent
                     log (injected into every prompt); `release` lets the publisher publish one head of a held case;
                     `allow-paths` approves protected-path changes for one head; `resolve` moves an escalated case on.
+
+STOP files
+  /etc/bw1-sandbox/STOP halts everything: the publisher units and the hospital (advance/charge).
+  /etc/bw1-sandbox/STOP-PUBLISH halts only the publisher (both its units and publisher.py itself), so the hospital
+  can run its stages while publishing stays off.
 
 Loops and circuit breaker
   plan rejected -> workup; changes requested or discharge failed -> treatment; more than 3 rework rounds -> escalate.
@@ -42,7 +52,7 @@ and the Chief's per-case overrides in <id>/chief.json (root-owned; ignored other
 Usage (as the sandbox user, except the Chief commands):
   hospital.py triage ID --fellow NAME --brief FILE [--title T] [--units A,B] [--functions F,G] [--impact low|mid|high]
                      [--difficulty low|mid|high] [--constraints FILE] [--base REV] [--start SHA] [--hold]
-                     [--fellow-model M] [--attending-model M] [--effort E]
+                     [--floor UNIT=MATCHED_FUNCTIONS]... [--fellow-model M] [--attending-model M] [--effort E]
   hospital.py advance ID          one step: evaluate the finished stage, then launch the next
   hospital.py charge              advance every open case (the bw1-hospital-charge timer; installed disabled)
   hospital.py status [ID]         cases, stages, rounds and escalations
@@ -79,6 +89,11 @@ IMAGE = "bw1-worker"
 MAX_ROUNDS = 3  # rework rounds; the 4th escalates
 MAX_RERUNS = 2  # re-runs of a stalled stage; the 3rd stall escalates
 MAX_DELTA = 1000  # changed lines from the case's start; more must be split
+# The Discharge container's caps. The droplet has 8 vCPUs and 16 GB; each worker gets 2 CPUs and 4g. Half the CPUs,
+# and 5g, leave two running workers (8g), the host and Ghidra (~2.5g) their memory (the Chief, 2026-10-12).
+DISCHARGE_CPUS = float(os.environ.get("DISCHARGE_CPUS", "4"))
+DISCHARGE_MEMORY = os.environ.get("DISCHARGE_MEMORY", "5g")
+EPS = 1e-4  # score tolerance (objdiff reports floats)
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -235,10 +250,12 @@ class PristineVerifier:
     """Discharge's build check in a throwaway worker-image container with no network (see verify.sh)."""
 
     def __init__(self, docker, repo: Path, version: str = "BW1W120", setup=None, image: str = IMAGE,
-                 shared_tree: str = SHARED_TREE, shared_data: str = SHARED_DATA, timeout: int = 6 * 3600):
+                 shared_tree: str = SHARED_TREE, shared_data: str = SHARED_DATA, timeout: int = 8 * 3600,
+                 cpus: float = DISCHARGE_CPUS, memory: str = DISCHARGE_MEMORY):
         self.docker, self.repo, self.version, self.image = docker, Path(repo), version, image
         self.setup = setup
         self.shared_tree, self.shared_data, self.timeout = shared_tree, shared_data, timeout
+        self.cpus, self.memory = cpus, memory
 
     @staticmethod
     def extract(repo: Path, rev: str, dest: Path, paths=()) -> None:
@@ -250,18 +267,24 @@ class PristineVerifier:
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
             tar.extractall(dest, filter="data")
 
-    def prepare(self, base: str, head: str, workdir: Path) -> None:
-        """workdir/tree = the base tree; workdir/head = the head tree with tools/ and configure.py from the base."""
-        for sub in ("tree", "head"):
+    def prepare(self, base: str, head: str, workdir: Path, start: str = "") -> None:
+        """workdir/tree = the base tree; workdir/head = the head tree, and workdir/start (only when start is given)
+        the start tree, both with tools/ and configure.py from the base. Old reports are removed."""
+        for sub in ("tree", "head", "start"):
             shutil.rmtree(workdir / sub, ignore_errors=True)
+        for f in ("verify.json", "base-report.json", "head-report.json"):
+            (workdir / f).unlink(missing_ok=True)
         self.extract(self.repo, base, workdir / "tree")
-        self.extract(self.repo, head, workdir / "head")
-        shutil.rmtree(workdir / "head" / "tools", ignore_errors=True)
-        (workdir / "head" / "configure.py").unlink(missing_ok=True)
         overlay = [p for p in ("tools", "configure.py")
                    if git(self.repo, "ls-tree", "--name-only", base, "--", p, check=False)]
-        if overlay:
-            self.extract(self.repo, base, workdir / "head", overlay)
+        for sub, rev in (("head", head), ("start", start)):
+            if not rev:
+                continue
+            self.extract(self.repo, rev, workdir / sub)
+            shutil.rmtree(workdir / sub / "tools", ignore_errors=True)
+            (workdir / sub / "configure.py").unlink(missing_ok=True)
+            if overlay:
+                self.extract(self.repo, base, workdir / sub, overlay)
         for sub in ("build/tools", "build/compilers"):
             (workdir / "tree" / sub).mkdir(parents=True, exist_ok=True)
         try:
@@ -277,7 +300,8 @@ class PristineVerifier:
         return dict(
             image=self.image, entrypoint=["/bin/sh", "/verify/verify.sh"], detach=True, user=f"{uid}:{gid}",
             network_mode="none", cap_drop=["ALL"], security_opt=["no-new-privileges"], read_only=True,
-            tmpfs={"/tmp": "rw,exec,size=4g"}, pids_limit=2048, working_dir="/work/tree",
+            tmpfs={"/tmp": "rw,exec,size=2g"}, pids_limit=2048, working_dir="/work/tree",
+            nano_cpus=int(self.cpus * 1e9), mem_limit=self.memory, memswap_limit=self.memory,
             environment={"WORKER_SETUP": json.dumps(self.setup or []), "VERSION": self.version,
                          "HOME": "/tmp/home"},
             volumes={str(workdir): {"bind": "/work", "mode": "rw"},
@@ -287,9 +311,14 @@ class PristineVerifier:
                      self.shared_data: {"bind": "/opt/orig", "mode": "ro"}},
         )
 
-    def __call__(self, base: str, head: str, workdir: Path):
-        """(passed, detail)."""
-        self.prepare(base, head, workdir)
+    def __call__(self, base: str, head: str, workdir: Path, start: str = ""):
+        """(passed, detail). Leaves workdir/base-report.json and head-report.json; with a start other than the base
+        whose report is not cached yet (workdir/start-report.json for that sha), also measures the start."""
+        start = start if start and start != base and cached_start(workdir) != start else ""
+        self.prepare(base, head, workdir, start)
+        if start:
+            for f in ("start-report.json", "start-report.sha"):
+                (workdir / f).unlink(missing_ok=True)
         args = self.container_args(workdir)
         image = args.pop("image")
         container = self.docker.containers.run(image, **args)
@@ -304,8 +333,98 @@ class PristineVerifier:
             steps = json.loads((workdir / "verify.json").read_text())
         except (OSError, ValueError):
             steps = {}
+        if start and steps.get("start") == 0 and (workdir / "start-report.json").is_file():
+            (workdir / "start-report.sha").write_text(start + "\n")
         detail = f"exit {code}; steps {steps or 'unknown'}; log {workdir / 'verify.log'}"
         return code == 0 and steps.get("regress") == 0, detail
+
+
+def cached_start(workdir: Path) -> str:
+    """The start sha whose report is cached in workdir, or ""."""
+    try:
+        if (workdir / "start-report.json").is_file():
+            return (workdir / "start-report.sha").read_text().strip()
+    except OSError:
+        pass
+    return ""
+
+
+def load_report(path: Path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data.get("report", data) if isinstance(data, dict) else None
+
+
+def report_unit(report: dict, unit: str):
+    """A report's unit by its full name or its last path component (CitadelHeart = runblack/Black/CitadelHeart)."""
+    for u in (report or {}).get("units", []):
+        if u.get("name") == unit or u.get("name", "").rsplit("/", 1)[-1] == unit:
+            return u
+    return None
+
+
+def unit_scores(u: dict) -> dict:
+    m = u.get("measures", {})
+    text = next((x for x in u.get("sections", []) if x.get("name") == ".text"), {})
+    return {"matched_functions": int(m.get("matched_functions", 0) or 0),
+            "total_functions": int(m.get("total_functions", 0) or 0),
+            "matched_code": int(m.get("matched_code", 0) or 0), "total_code": int(m.get("total_code", 0) or 0),
+            "fuzzy": float(m.get("fuzzy_match_percent", 0.0) or 0.0),
+            "text_fuzzy": float(text.get("fuzzy_match_percent", 0.0) or 0.0)}
+
+
+def function_targets(names, function: str) -> bool:
+    """Whether a report function name (MSVC-mangled) is one of the case's functions (Class::Method or a name)."""
+    for f in names:
+        if function == f:
+            return True
+        parts = f.split("::")
+        if len(parts) >= 2 and function.startswith("?" + "@".join(reversed(parts)) + "@@"):
+            return True
+        if len(parts) == 1 and (function.startswith(f"?{f}@") or function.lstrip("_") == f):
+            return True
+    return False
+
+
+def progress(c: dict, start_report, head_report):
+    """(problems, record) for the case's progress from its start to its head (see the docstring)."""
+    units, floors, wanted = c.get("units") or [], c.get("floors") or {}, c.get("functions") or []
+    if not units:
+        return ["the case lists no units, so its progress can't be measured"], {}
+    if start_report is None or head_report is None:
+        return [f"no {'start' if start_report is None else 'head'} report to measure progress with"], {}
+    problems, record, improved = [], {"units": {}, "improved": []}, []
+    for unit in units:
+        s_u, h_u = report_unit(start_report, unit), report_unit(head_report, unit)
+        if h_u is None or s_u is None:
+            problems.append(f"{unit}: not in the {'head' if h_u is None else 'start'} report")
+            continue
+        s, h = unit_scores(s_u), unit_scores(h_u)
+        record["units"][unit] = {"start": s, "head": h, "floor": floors.get(unit)}
+        for key, label in (("matched_functions", "matched functions"), ("matched_code", "matched code")):
+            if h[key] < s[key]:
+                problems.append(f"{unit}: {label} {h[key]} < {s[key]} at the start")
+        for key, label in (("fuzzy", "fuzzy match"), ("text_fuzzy", ".text score")):
+            if h[key] < s[key] - EPS:
+                problems.append(f"{unit}: {label} {h[key]:.4f}% < {s[key]:.4f}% at the start")
+        if unit in floors and h["matched_functions"] < int(floors[unit]):
+            problems.append(f"{unit}: {h['matched_functions']} matched functions, below the triage floor "
+                            f"{floors[unit]}")
+        before = {f.get("name"): float(f.get("fuzzy_match_percent", 0.0) or 0.0) for f in s_u.get("functions", [])}
+        for f in h_u.get("functions", []):
+            name = f.get("name", "")
+            if wanted and not function_targets(wanted, name):
+                continue
+            score = float(f.get("fuzzy_match_percent", 0.0) or 0.0)
+            if score > before.get(name, 0.0) + EPS:
+                improved.append(f"{unit}: {name} {before.get(name, 0.0):.2f}% -> {score:.2f}%")
+    record["improved"] = improved
+    if not improved:
+        problems.append("no target function improved from the start "
+                        + (f"(functions {', '.join(wanted)})" if wanted else f"(units {', '.join(units)})"))
+    return problems, record
 
 
 # ------------------------------------------------------------------------------------------------- the hospital
@@ -407,7 +526,7 @@ class Hospital:
 
     def triage(self, cid: str, fellow: str, brief: str, title: str = "", units=(), functions=(), impact: str = "mid",
                difficulty: str = "mid", constraints: str = "", base: str = "", start: str = "", hold: bool = False,
-               fellow_model: str = "", attending_model: str = "", effort: str = "") -> dict:
+               fellow_model: str = "", attending_model: str = "", effort: str = "", floors=None) -> dict:
         d = self.dir(cid)
         if d.exists():
             raise HospitalError(f"case {cid} exists")
@@ -434,7 +553,7 @@ class Hospital:
              "units": list(units), "functions": list(functions), "models": {"fellow": fellow_model,
                                                                             "attending": attending_model},
              "effort": effort, "created": now(), "feedback": "", "reviews": [], "reviewed_head": "",
-             "plan_review": "", "code_review": ""}
+             "plan_review": "", "code_review": "", "floors": dict(floors or {})}
         if start and self.ward.head(fellow) != start:
             old_head = self.ward.start_from(fellow, start, cid)
             c["old_head"] = old_head
@@ -447,10 +566,15 @@ class Hospital:
             f"- Hold: {'yes: the Chief decides on publishing' if hold else 'no'}",
             f"- Units: {', '.join(units) or '(see brief)'}",
             f"- Functions: {', '.join(functions) or '(see brief)'}",
+            "- Progress floor (matched functions): "
+            + (", ".join(f"{u} >= {n}" for u, n in sorted((floors or {}).items())) or "the start's own scores"),
             "", "## Brief", "", brief.strip(), "",
             "## Constraints", "",
             (constraints.strip() or "None beyond AGENTS.md, the preamble's rules and the precedents."), "",
             f"- The case's change (start..head) stays at or under {MAX_DELTA} changed lines; larger cases are split.",
+            "- Discharge needs progress: no regression against the base, every unit at or above its score at "
+            "the start (and its floor), and at least one target function scoring higher than at the start. Without "
+            "that, the case goes to the Chief.",
             "- Protected files (config/**, tools/**, configure.py, build files, AGENTS.md, hooks) are not changed; "
             "any such need goes to the Chief.", ""])
         self.put(cid, "case.md", case_md)
@@ -763,13 +887,26 @@ class Hospital:
             if self.verifier is None:
                 item("verify", "Pristine verification (no network, base tools)", ["no verifier configured"])
             else:
-                ok, detail = self.verifier(c["base"], head, workdir)
+                ok, detail = self.verifier(c["base"], head, workdir, start)
                 item("verify", "Pristine verification (no network, base tools)", [] if ok else [detail])
                 items[-1]["detail"] = detail
         else:
             item("verify", "Pristine verification (no network, base tools)", [], skipped=True)
+        record = {}
+        if all(i["ok"] for i in items):
+            start_report = load_report(workdir / ("base-report.json" if start == c["base"] else "start-report.json"))
+            if start != c["base"] and cached_start(workdir) != start:
+                start_report = None
+            pproblems, record = progress(c, start_report, load_report(workdir / "head-report.json"))
+            item("progress", "Progress: units at or above the start and floor, a target function improved",
+                 pproblems)
+            if record.get("units") and not c.get("baseline"):
+                c["baseline"] = {"start": start, **{u: v["start"] for u, v in record["units"].items()}}
+        else:
+            item("progress", "Progress: units at or above the start and floor, a target function improved", [],
+                 skipped=True)
         passed = all(i["ok"] for i in items)
-        result = {"case": cid, "head": head, "passed": passed, "at": now(), "items": items,
+        result = {"case": cid, "head": head, "passed": passed, "at": now(), "items": items, "progress": record,
                   "warnings": [f"{f.rule}: {f.path}:{f.line} {f.detail}".strip() for f in warn]}
         self.put(cid, "discharge.json", json.dumps(result, indent=2) + "\n")
         self.put(cid, "checklist.md", checklist_md(result))
@@ -781,6 +918,9 @@ class Hospital:
             return self.escalate(c, f"discharge found tampering ({', '.join(sorted(failed))}); see checklist.md")
         if "delta" in failed:
             return self.escalate(c, f"case delta {delta} > {MAX_DELTA} lines: split the case")
+        if "progress" in failed:
+            return self.escalate(c, "discharge found no progress (units below the start or floor, or no target "
+                                    "function improved); see checklist.md")
         return self.rework(c, "treatment", "checklist.md", f"discharge failed: {', '.join(sorted(failed))}")
 
     def discharge(self, cid: str) -> str:
@@ -891,6 +1031,17 @@ def checklist_md(result: dict) -> str:
         mark = "skipped" if i["skipped"] else ("ok" if i["ok"] else "FAIL")
         probs = "; ".join(i["problems"])[:600].replace("|", "\\|") or ""
         out.append(f"| {i['label']} | {mark} | {probs} |")
+    prog = result.get("progress") or {}
+    if prog.get("units"):
+        out += ["", "| Unit | Matched functions (start -> head) | Fuzzy % | .text % | Floor |",
+                "|------|------|------|------|------|"]
+        for unit, v in prog["units"].items():
+            s, h = v["start"], v["head"]
+            out.append(f"| {unit} | {s['matched_functions']}/{s['total_functions']} -> "
+                       f"{h['matched_functions']}/{h['total_functions']} | {s['fuzzy']:.2f} -> {h['fuzzy']:.2f} | "
+                       f"{s['text_fuzzy']:.2f} -> {h['text_fuzzy']:.2f} | {v.get('floor') or '-'} |")
+        out += ["", f"Improved functions ({len(prog.get('improved', []))}):", ""]
+        out += [f"- {x}" for x in prog.get("improved", [])[:40]] or ["- none"]
     if result.get("warnings"):
         out += ["", f"Quality gate warnings ({len(result['warnings'])}):", ""]
         out += [f"- {w}" for w in result["warnings"][:80]]
@@ -913,6 +1064,8 @@ def main(argv=None) -> int:
     t.add_argument("--base", default="")
     t.add_argument("--start", default="")
     t.add_argument("--hold", action="store_true")
+    t.add_argument("--floor", action="append", default=[], metavar="UNIT=N",
+                   help="the unit must end with at least N matched functions (objdiff report); repeatable")
     t.add_argument("--fellow-model", default="")
     t.add_argument("--attending-model", default="")
     t.add_argument("--effort", default="")
@@ -952,10 +1105,16 @@ def main(argv=None) -> int:
         hosp = Hospital(ward, verifier=verifier)
         if a.cmd == "triage":
             split = lambda s: [x.strip() for x in s.split(",") if x.strip()]
+            floors = {}
+            for f in a.floor:
+                unit, _, n = f.partition("=")
+                if not unit or not n.isdigit():
+                    raise HospitalError(f"bad --floor {f!r} (UNIT=N)")
+                floors[unit] = int(n)
             c = hosp.triage(a.id, a.fellow, Path(a.brief).read_text(encoding="utf-8"), a.title, split(a.units),
                             split(a.functions), a.impact, a.difficulty,
                             Path(a.constraints).read_text(encoding="utf-8") if a.constraints else "", a.base, a.start,
-                            a.hold, a.fellow_model, a.attending_model, a.effort)
+                            a.hold, a.fellow_model, a.attending_model, a.effort, floors)
             print(f"triaged {c['id']}: stage {c['stage']}, base {c['base'][:10]}, start {c['start'][:10]}, "
                   f"hold {c['hold']}" + (f", old head {c['old_head'][:10]}" if c["old_head"] else ""))
         elif a.cmd == "advance":

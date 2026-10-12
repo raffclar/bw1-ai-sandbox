@@ -6,7 +6,7 @@ Nurse check before they act.
   integrity.py check [--manifest /etc/bw1-sandbox/integrity.json]                                   (exit 1 = refuse)
 
 The manifest lists
-  files         the host's copies of the quality gate, hospital.py, this file, the publisher, the harness rules,
+  files         the host's copies of the quality gate, hospital.py, this file, the publisher, the harness rules, sandbox_droplet.py,
                 the worker hooks and the hospital's prompts, templates and verification script (absolute paths), and
   worker_hooks  what each worker must have installed, relative to its folder /srv/decomp/workers/<name>/
                 (home/.claude/hooks/*, repo/.git/hooks/pre-commit); the Discharge Nurse compares them.
@@ -25,6 +25,7 @@ from pathlib import Path
 DROPLET = Path("/opt/bw1-sandbox/droplet")
 MANIFEST = Path("/etc/bw1-sandbox/integrity.json")
 HOST_FILES = ("quality_gate.py", "hospital.py", "integrity.py", "publisher.py", "preamble-droplet.md",
+              "sandbox_droplet.py",  # it scopes an Attending's /peers mount to the Fellow's repo
               "hooks/install_hooks.py", "hooks/no_extern.py", "hooks/stop_gate.py", "hooks/pre-commit")
 HOSPITAL_DIR = "hospital"  # prompts, templates and the discharge verification script: every file in it
 WORKER_HOOKS = {  # path in the worker's folder -> source in the droplet folder

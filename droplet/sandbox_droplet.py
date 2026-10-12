@@ -31,6 +31,9 @@ Every change, so it can be offered upstream or rebased (see also README "Changes
   destroy         deletes the VM                         refused (terraform destroy / teardown.ps1)
   ghidra_forward  forwards to host Ghidra                refused (Ghidra runs on the droplet: bw1-ghidra)
   portal          any --host with --pants-down-mode      localhost only; --pants-down-mode refused
+  _launch         every worker gets /peers (all workers,  a hospital Attending (att-<case>-<n>) gets only
+                  read-only)                             /peers/<fellow>/repo, read-only: never the Fellow's
+                                                         home (transcript, notes) or any other worker's folder
 
 Usage (as the `sandbox` user, from anywhere):
   sandbox_droplet.py sandbox <sandbox.py args...>   e.g. `sandbox spawn farmer "..." -m opus`
@@ -42,6 +45,7 @@ Usage (as the `sandbox` user, from anywhere):
 
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -53,6 +57,56 @@ os.environ.setdefault("SANDBOX_CONFIG", str(SANDBOX_DIR / "sandbox.droplet.toml"
 EGRESS = ["sudo", "-n", "/usr/local/sbin/bw1-egress"]
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
 GHIDRA_CONF = Path("/etc/bw1-sandbox/ghidra.conf")
+CASES = Path(os.environ.get("BW1_CASES", "/var/lib/bw1-sandbox/cases"))
+ATTENDING_RE = re.compile(r"^att-([a-z0-9][a-z0-9-]{0,30})-(\d+)$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def attending_fellow(name: str, cases: Path = None):
+    """For a hospital Attending (att-<case>-<n>): (True, the case's Fellow, or "" when the case can't be read).
+    For any other worker: (False, "")."""
+    m = ATTENDING_RE.match(name or "")
+    if not m:
+        return False, ""
+    try:
+        fellow = json.loads(((cases or CASES) / m.group(1) / "case.json").read_text(encoding="utf-8")).get("fellow", "")
+    except (OSError, ValueError, AttributeError):
+        return True, ""
+    return True, fellow if isinstance(fellow, str) and NAME_RE.match(fellow) and fellow != name else ""
+
+
+def scope_peers(volumes: dict, workers: str, fellow: str) -> dict:
+    """The volumes with the all-workers /peers mount replaced by the Fellow's repo alone (read-only), or by nothing
+    when there is no Fellow: fail closed."""
+    out = {src: spec for src, spec in volumes.items()
+           if not (isinstance(spec, dict) and str(spec.get("bind", "")).rstrip("/") == "/peers")
+           and not str(src).rstrip("/") == workers.rstrip("/")}
+    if fellow:
+        out[f"{workers.rstrip('/')}/{fellow}/repo"] = {"bind": f"/peers/{fellow}/repo", "mode": "ro"}
+    return out
+
+
+class _ScopedContainers:
+    def __init__(self, real, workers: str, fellow: str):
+        self._real, self._workers, self._fellow = real, workers, fellow
+
+    def run(self, image, *args, **kwargs):
+        kwargs["volumes"] = scope_peers(kwargs.get("volumes") or {}, self._workers, self._fellow)
+        return self._real.run(image, *args, **kwargs)
+
+    def __getattr__(self, attr):
+        return getattr(self._real, attr)
+
+
+class _ScopedDocker:
+    """The sandbox's Docker client, except that containers.run() mounts only the Fellow's repo under /peers."""
+
+    def __init__(self, real, workers: str, fellow: str):
+        self._real = real
+        self.containers = _ScopedContainers(real.containers, workers, fellow)
+
+    def __getattr__(self, attr):
+        return getattr(self._real, attr)
 
 
 def ghidra_port():
@@ -199,6 +253,30 @@ def patch(sb_mod) -> None:
     }
     for name in REFUSALS:
         setattr(S, name, refuse(name))
+
+    # Attending isolation: upstream mounts every worker folder at /peers. A hospital Attending reviews only the
+    # Fellow's commits, so it gets /peers/<fellow>/repo and nothing else, on every launch path (spawn, resume,
+    # autoresume, the portal), because it is keyed on the worker's name.
+    if not getattr(S, "_bw1_peers_scoped", False):
+        orig_launch, orig_docker = S._launch, S.docker
+
+        def _launch(self, name, *args, **kwargs):
+            is_att, fellow = attending_fellow(name)
+            if not is_att:
+                return orig_launch(self, name, *args, **kwargs)
+            self._bw1_peer_scope = fellow
+            try:
+                return orig_launch(self, name, *args, **kwargs)
+            finally:
+                self._bw1_peer_scope = None
+
+        def docker(self):
+            real = orig_docker.fget(self)
+            scope = getattr(self, "_bw1_peer_scope", None)
+            return real if scope is None else _ScopedDocker(real, getattr(sb_mod, "WORKERS", "/srv/decomp/workers"),
+                                                            scope)
+
+        S._launch, S.docker, S._bw1_peers_scoped = _launch, property(docker), True
     for fn in (vm_state, vm_ip, host_ip, locked, setup_host, create, build_image, lockdown, check):
         setattr(S, fn.__name__, fn)
 

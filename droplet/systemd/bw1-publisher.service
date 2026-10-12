@@ -3,6 +3,7 @@ Description=bw1 sandbox: publish finished workers as draft PRs on the fork
 Wants=bw1-sandbox-export.service
 After=bw1-sandbox-export.service network-online.target
 ConditionPathExists=!/etc/bw1-sandbox/STOP
+ConditionPathExists=!/etc/bw1-sandbox/STOP-PUBLISH
 
 [Service]
 Type=oneshot

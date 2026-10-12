@@ -2,8 +2,8 @@
 """Quality gate for bw1-decomp worker changes: the maintainer's review rules (bwrsandman on PR #431) and
 AGENTS.md, checked on the C/C++ lines a change ADDS (base..head, or the staged diff).
 
-  quality_gate.py [--repo DIR] [--base REV] (--head REV | --staged) [--allow-paths-from REV] [--allow-path P]...
-                  [--json] [paths...]
+  quality_gate.py [--repo DIR] [--base REV] (--head REV | --staged) [--asm-base REV] [--allow-paths-from REV]
+                  [--allow-path P]... [--json] [paths...]
 
 Exit status: 0 = no hard failures (warnings may be printed), 1 = hard failures, 2 = usage or git error.
 With --json the summary also says whether the change must escalate to the Chief (a tamper-path finding).
@@ -19,18 +19,23 @@ Hard failures (a commit, a review and the publisher refuse them):
                   re_common.h or windef.h's min/max fit
   mid-file        an #include, global definition or declaration after the first function body of a .c/.cpp
 Anti-cheat (hard; a match must come from plain C++ that the original compiler turns into the original bytes):
-  inline-asm      __asm / _asm / asm( blocks and __declspec(naked) functions
+  inline-asm      __asm / _asm / asm( blocks in a file that had no inline asm at the asm base (--asm-base, default
+                  --base: the case's upstream merge-base), and __declspec(naked) functions anywhere
   emit            _emit / __emit (raw bytes in the instruction stream)
   pragma-section  #pragma code_seg/data_seg/const_seg/bss_seg/section/alloc_text and #pragma comment(linker, ...)
   byte-code       a byte array or string literal cast to a function pointer
   tamper-path     any change to the build, the verification tools or the harness: objdiff.json, build.ninja,
-                  configure.py, config/**, tools/** (except the matching ledger), build/**, object files, and the
+                  configure.py, config/**, tools/** (all of it, the matching ledger included), build/**, object
+                  files, and the
                   agent rules and hooks (AGENTS.md, CLAUDE.md, .claude/**, .github/**, .clang-format). This one also
                   ESCALATES to the Chief (the user), who alone approves such a change. --allow-paths-from REV allows
                   a path whose content at head is exactly its content at REV (a case's starting point, whose config
                   changes the user already merged); --allow-path allows one path outright (the Chief's override
                   for one case and head).
 Warnings (reported, never failing):
+  inline-asm-existing  __asm / _asm / asm( added to a file that already contained inline asm at the asm base (e.g.
+                  CPUCheck.cpp upstream). Allowed, but reported so a reviewer checks it. naked, _emit, section pragmas
+                  and byte-code stay hard there too.
   clamp-if        a single one-sided `if (x < lo) x = lo;`: that is CLAMP's own expansion and may be what the
                   original wrote. A two-sided if/else-if clamp stays a hard `clamp`.
   pragma-opt      a #pragma optimize/inline_depth/auto_inline line that is not already in the base tree
@@ -71,7 +76,10 @@ HINTS = {
                 "CLAMP or min/max gives the same bytes, use it (tools/minmax-scan.py --verify --apply).",
     "inline-asm": "Anti-cheat: a match must come from C++ that the original compiler turns into the original bytes; "
                   "inline assembly and naked functions copy the bytes instead. Write the C++, and leave the function "
-                  "NonMatching with a TODO if it won't match.",
+                  "NonMatching with a TODO if it won't match. (Inline asm is only allowed in files that already had "
+                  "it upstream, such as CPUCheck.cpp; naked functions never.)",
+    "inline-asm-existing": "This file already had inline asm upstream, so asm here is allowed. A reviewer checks it is "
+                           "the original's own asm (as in the existing blocks), not bytes copied to force a match.",
     "emit": "Anti-cheat: _emit writes raw bytes into the code. Never; write the C++ and leave it NonMatching.",
     "pragma-section": "Anti-cheat: section, alloc_text and linker pragmas move code or data to force a layout. The "
                       "layout comes from splits.txt and the real symbols; changing it is a Chief decision.",
@@ -91,8 +99,9 @@ ESCALATE = {"tamper-path"}
 TAMPER_PATHS = ("objdiff.json", "build.ninja", "configure.py", "config/*", "tools/*", "build/*", "*.o", "*.obj",
                 "*.lib", "*.a", "*.exe", "*.dll", "AGENTS.md", "CLAUDE.md", ".claude/*", ".github/*", ".clang-format",
                 ".githooks/*", "*/.claude/*")
-TAMPER_EXEMPT = ("tools/matching_ledger.jsonl",)  # the matching ledger is data the workflow appends to
-ASM_RE = re.compile(r"\b(?:__asm|_asm)\b|\basm\s*(?:\(|\{|volatile\b)|__declspec\s*\(\s*naked\s*\)")
+TAMPER_EXEMPT = ()  # none: tools/** is protected in full, tools/matching_ledger.jsonl included (the Chief, 2026-10-12)
+ASM_RE = re.compile(r"\b(?:__asm|_asm)\b|\basm\s*(?:\(|\{|volatile\b)")
+NAKED_RE = re.compile(r"__declspec\s*\(\s*naked\s*\)")
 EMIT_RE = re.compile(r"\b__?emit\b")
 PRAGMA_SECTION_RE = re.compile(r"^\s*#\s*pragma\s+(?:(?:code_seg|data_seg|const_seg|bss_seg|section|alloc_text)\b|"
                                r"comment\s*\(\s*linker\b)")
@@ -136,8 +145,9 @@ class GitError(Exception):
 class Source:
     """Reads the change from git: the files at head (or in the index) and the lines added since base."""
 
-    def __init__(self, repo: str, base: str, head: str = "", staged: bool = False, paths=()):
+    def __init__(self, repo: str, base: str, head: str = "", staged: bool = False, paths=(), asm_base: str = ""):
         self.repo, self.base, self.head, self.staged = repo, base, head, staged
+        self.asm_base = asm_base or base
         self.paths = list(paths)
 
     def git(self, *args, check=True) -> str:
@@ -208,6 +218,18 @@ class Source:
         """The blob id of path at rev ("" if absent); rev ":" means the index."""
         spec = f":{path}" if rev == ":" else f"{rev}:{path}"
         return self.git("rev-parse", "-q", "--verify", spec, check=False).strip()
+
+    def asm_files(self) -> set:
+        """Source paths that contain inline asm (outside comments and strings) at the asm base."""
+        text = self.git("grep", "-l", "-E", r"(__asm|_asm|asm[[:space:]]*[({]|asm[[:space:]]+volatile)",
+                        self.asm_base, "--", *["*" + s for s in SOURCES], check=False)
+        out = set()
+        for row in text.splitlines():
+            path = row[len(self.asm_base) + 1:] if row.startswith(self.asm_base + ":") else row
+            body = self.git("show", f"{self.asm_base}:{path}", check=False)
+            if any(ASM_RE.search(c) for c in strip_code(body.splitlines())):
+                out.add(path)
+        return out
 
     def base_pragmas(self) -> set:
         """Normalised #pragma optimize/inline_depth/auto_inline lines already in the base tree."""
@@ -410,7 +432,7 @@ def function_name(sig: str) -> str:
 
 # ------------------------------------------------------------------------------------------------- checks
 
-def check_file(path, text, added, symbols, macros, pragmas=frozenset()):
+def check_file(path, text, added, symbols, macros, pragmas=frozenset(), asm_files=frozenset()):
     findings = []
     lines = text.splitlines()
     code = strip_code(lines)
@@ -425,8 +447,13 @@ def check_file(path, text, added, symbols, macros, pragmas=frozenset()):
     for i, c in enumerate(code, 1):
         if i not in added:
             continue
-        if ASM_RE.search(c):
-            add("inline-asm", i)
+        if NAKED_RE.search(c):
+            add("inline-asm", i, "naked function")
+        elif ASM_RE.search(c):
+            if path in asm_files:
+                add("inline-asm-existing", i, "the file had inline asm at the asm base")
+            else:
+                add("inline-asm", i)
         if EMIT_RE.search(c):
             add("emit", i)
         if PRAGMA_SECTION_RE.search(c):
@@ -680,10 +707,11 @@ def check_if_selects(path, lines, code, added, pp=frozenset()):
 
 
 def run(repo: str, base: str, head: str = "", staged: bool = False, paths=(), allow_from: str = "",
-        allow_paths=()):
+        allow_paths=(), asm_base: str = ""):
     """All findings of the change base..head (or the staged diff): the C/C++ rules on added lines, plus tamper-path
-    findings for every changed path (except those allowed by allow_from / allow_paths)."""
-    src = Source(repo, base, head, staged, paths)
+    findings for every changed path (except those allowed by allow_from / allow_paths). asm_base (default base) is
+    the revision whose files may keep gaining inline asm (a file that had none there may not)."""
+    src = Source(repo, base, head, staged, paths, asm_base)
     findings = tamper_findings(src, allow_from, allow_paths)
     added = src.added()
     if not added:
@@ -691,9 +719,13 @@ def run(repo: str, base: str, head: str = "", staged: bool = False, paths=(), al
     symbols = src.symbols() if any(p.endswith(CODE) for p in added) else (set(), set())
     macros = src.base_macros() if any(p.endswith(HEADERS) for p in added) else set()
     pragmas = src.base_pragmas()
+    asm_files = None
     for path, rows in sorted(added.items()):
         if rows:
-            findings += check_file(path, src.show(path), rows, symbols, macros, pragmas)
+            text = src.show(path)
+            if asm_files is None and any(ASM_RE.search(c) for c in strip_code(text.splitlines())):
+                asm_files = src.asm_files()  # only looked up when a changed file has asm at all
+            findings += check_file(path, text, rows, symbols, macros, pragmas, asm_files or frozenset())
     return findings
 
 
@@ -713,6 +745,9 @@ def main(argv=None) -> int:
     ap.add_argument("--base", default="", help="default: merge-base of origin/main and HEAD")
     ap.add_argument("--head", default="HEAD")
     ap.add_argument("--staged", action="store_true", help="check the staged diff against --base (default HEAD)")
+    ap.add_argument("--asm-base", default="", metavar="REV",
+                    help="files with inline asm at REV may gain more (default: --base; the pre-commit hook passes the "
+                         "case's merge-base, since its --base is HEAD)")
     ap.add_argument("--allow-paths-from", default="", metavar="REV",
                     help="allow a protected path whose content at head equals its content at REV")
     ap.add_argument("--allow-path", action="append", default=[], metavar="PATH",
@@ -731,7 +766,7 @@ def main(argv=None) -> int:
                 if not base:
                     print("quality_gate: no --base and no merge base with origin/main", file=sys.stderr)
                     return 2
-        findings = run(a.repo, base, a.head, a.staged, a.paths, a.allow_paths_from, a.allow_path)
+        findings = run(a.repo, base, a.head, a.staged, a.paths, a.allow_paths_from, a.allow_path, a.asm_base)
     except GitError as e:
         print(f"quality_gate: {e}", file=sys.stderr)
         return 2

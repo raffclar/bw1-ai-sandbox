@@ -65,6 +65,8 @@ DEFAULTS = {
     "COMMENTS_DIR": "/var/lib/bw1-publisher/comments",
     "LOG": "/var/log/bw1-publisher/publisher.log",
     "STOP_FILE": "/etc/bw1-sandbox/STOP",
+    # Publisher-only hold: stops publishing (and the comment follower) but not the hospital's stages
+    "PUBLISH_STOP_FILE": "/etc/bw1-sandbox/STOP-PUBLISH",
     "GITHUB_ENV": "/etc/bw1-sandbox/github.env",
     "OPENBLACK_ENV": "/etc/bw1-sandbox/github-openblack-pr.env",
     "GH_BIN": "gh",
@@ -78,7 +80,7 @@ DEFAULTS = {
     "MAX_OPEN_PRS": "5",
     "MAX_CHANGED_FILES": "40",
     "MAX_CHANGED_LINES": "4000",
-    "ALLOWED_PATHS": "src/*,include/*,tools/matching_ledger.jsonl",
+    "ALLOWED_PATHS": "src/*,include/*",  # tools/** is protected in full (the ledger too)
     # A worker branch that also changes these goes out as two draft PRs: the code (ALLOWED_PATHS) in one, these in
     # another. Anything matching neither list is still refused.
     "SPLIT_PATHS": "config/*,configure.py",
@@ -330,8 +332,9 @@ class Publisher:
         prefix = self.cfg["BRANCH_PREFIX"]
         if not re.match(r"^[a-z0-9][a-z0-9._-]*/$", prefix) or prefix.startswith(("main", "master")):
             raise SystemExit(f"bad BRANCH_PREFIX {prefix!r}")
-        if os.path.exists(self.cfg["STOP_FILE"]):
-            raise Stop(f"stop file {self.cfg['STOP_FILE']} present")
+        for key in ("STOP_FILE", "PUBLISH_STOP_FILE"):
+            if self.cfg.get(key) and os.path.exists(self.cfg[key]):
+                raise Stop(f"stop file {self.cfg[key]} present")
         self.tokens["fork"] = read_env(self.cfg["GITHUB_ENV"]).get("GH_TOKEN", "")
         self.tokens["openblack"] = read_env(self.cfg["OPENBLACK_ENV"]).get("GH_OPENBLACK_PR_TOKEN", "")
         if self.tokens["openblack"] and self.tokens["openblack"] == self.tokens["fork"]:

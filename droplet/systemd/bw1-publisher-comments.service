@@ -2,6 +2,7 @@
 Description=bw1 sandbox: collect new comments and reviews on the harness's PRs
 After=network-online.target
 ConditionPathExists=!/etc/bw1-sandbox/STOP
+ConditionPathExists=!/etc/bw1-sandbox/STOP-PUBLISH
 
 [Service]
 Type=oneshot

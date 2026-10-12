@@ -5,7 +5,10 @@
 # Discharge Nurse and the publisher run the same gate on the host.
 hooks="$HOME/.claude/hooks"
 python3 "$hooks/no_extern.py" pre-commit || exit 1
-python3 "$hooks/quality_gate.py" --staged
+# Files that had inline asm at the case's base (or the merge-base with origin/main) may keep it: --asm-base
+asm_base=$(awk 'NR==1{print $1; exit}' "$HOME/case/gate-base" 2>/dev/null)
+[ -n "$asm_base" ] || asm_base=$(git merge-base origin/main HEAD 2>/dev/null)
+python3 "$hooks/quality_gate.py" --staged ${asm_base:+--asm-base "$asm_base"}
 status=$?
 if [ "$status" -eq 1 ]; then
 	echo "commit refused by the quality gate (hard failures above). Fix them; don't work around the gate." >&2

@@ -159,7 +159,7 @@ class RepoTests(unittest.TestCase):
         c = dict(P.DEFAULTS)
         c.update({"EXPORT": str(t / "workers.json"), "SANDBOX_CLONE": str(t / "C"), "PUBLISH_CLONE": str(t / "P.git"),
                   "STATE": str(t / "state.json"), "COMMENTS_DIR": str(t / "comments"), "LOG": str(t / "pub.log"),
-                  "STOP_FILE": str(t / "STOP"), "GITHUB_ENV": str(t / "github.env"), "OPENBLACK_ENV": str(t / "openblack.env"),
+                  "STOP_FILE": str(t / "STOP"), "PUBLISH_STOP_FILE": str(t / "STOP-PUBLISH"), "GITHUB_ENV": str(t / "github.env"), "OPENBLACK_ENV": str(t / "openblack.env"),
                   "GH_BIN": f"{Path(sys.executable).as_posix()} {(HERE / 'fake_gh.py').as_posix()}",
                   "FEEDBACK_DIR": str(t / "feedback"),
                   # the hospital's guards have their own tests below (HospitalGuardTests)
@@ -169,6 +169,20 @@ class RepoTests(unittest.TestCase):
 
     def gh_calls(self):
         return [json.loads(line) for line in (self.t / "gh.log").read_text().splitlines() if line]
+
+    def test_stop_files_halt_the_publisher(self):
+        # STOP halts everything; STOP-PUBLISH halts only the publisher (the hospital keeps running its stages)
+        for name in ("STOP", "STOP-PUBLISH"):
+            (self.t / name).write_text("")
+            with self.assertRaises(P.Stop):
+                P.Publisher(self.cfg(), dry_run=True).guards()
+            (self.t / name).unlink()
+        P.Publisher(self.cfg(), dry_run=True).guards()
+        for unit in ("bw1-publisher.service", "bw1-publisher-comments.service"):
+            text = (HERE.parent / "systemd" / unit).read_text()
+            self.assertIn("ConditionPathExists=!/etc/bw1-sandbox/STOP-PUBLISH", text, unit)
+        self.assertNotIn("STOP-PUBLISH", (HERE.parent / "systemd" / "bw1-hospital-charge.service").read_text())
+        self.assertEqual(P.DEFAULTS["ALLOWED_PATHS"], "src/*,include/*")  # no tools/ exception, the ledger included
 
     def test_push_url_guard(self):
         pub = P.Publisher(self.cfg(), dry_run=True)

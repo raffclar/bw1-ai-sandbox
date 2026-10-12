@@ -47,7 +47,7 @@ orig_archive_path = "E:/bw1-original.zip"
 # publish_interval = "30min"
 # max_prs_per_day  = 3
 # max_open_prs     = 5
-# allowed_paths    = ["src/*", "include/*", "tools/matching_ledger.jsonl"]
+# allowed_paths    = ["src/*", "include/*"]
 
 # Reviewer comments on harness PRs are collected every 15 minutes. Optionally feed them back to the
 # worker that made the PR (off by default; only comments from these logins, default the fork owner).

@@ -32,11 +32,12 @@ commit), when you stop, and again on the host before anything is published. Hard
 - `extern` anywhere; anonymous enums of constants; header `#ifdef` toggles on new macros; `field_0x..` uses in .cpp
   code; non-symbol helper functions in a .cpp; hand-written two-sided clamps, ternary min/max, if/else and if-return
   selects; includes, globals or declarations after the first function.
-- Anti-cheat: inline assembly (`__asm`, `_asm`, `asm(`), `__declspec(naked)`, `_emit`, `#pragma
-  code_seg/data_seg/const_seg/bss_seg/section/alloc_text`, `#pragma comment(linker, ...)`, and bytes or strings cast
-  to function pointers. A match must come from C++ that the original compiler turns into the original bytes.
-- Protected files, which you never change: objdiff.json, build.ninja, configure.py, config/**, tools/** (except
-  tools/matching_ledger.jsonl), build/**, object files, AGENTS.md, CLAUDE.md, .claude/**, .github/**,
+- Anti-cheat: inline assembly (`__asm`, `_asm`, `asm(`) in any file that had none upstream, `__declspec(naked)`,
+  `_emit`, `#pragma code_seg/data_seg/const_seg/bss_seg/section/alloc_text`, `#pragma comment(linker, ...)`, and
+  bytes or strings cast to function pointers. A match must come from C++ that the original compiler turns into the
+  original bytes. (Files that already contain inline asm upstream, such as CPUCheck.cpp, may keep using it.)
+- Protected files, which you never change: objdiff.json, build.ninja, configure.py, config/**, tools/** (all of it,
+  tools/matching_ledger.jsonl included), build/**, object files, AGENTS.md, CLAUDE.md, .claude/**, .github/**,
   .clang-format. Changing one escalates to the human, who alone decides. If a task truly needs a symbols.txt or
   splits.txt change, say so in your summary (or in `~/case/handoff.md`) instead of making it.
 - Warnings (fix them where you can): a one-sided `if (x < lo) x = lo;`, new `#pragma optimize/inline_depth/

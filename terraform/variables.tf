@@ -294,7 +294,7 @@ variable "max_open_prs" {
 variable "allowed_paths" {
   description = "A worker branch is published only if every changed file matches one of these globs."
   type        = list(string)
-  default     = ["src/*", "include/*", "tools/matching_ledger.jsonl"]
+  default     = ["src/*", "include/*"]
 }
 
 # --- DigitalOcean project ---------------------------------------------------------------------
