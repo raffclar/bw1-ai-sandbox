@@ -161,7 +161,9 @@ class RepoTests(unittest.TestCase):
                   "STATE": str(t / "state.json"), "COMMENTS_DIR": str(t / "comments"), "LOG": str(t / "pub.log"),
                   "STOP_FILE": str(t / "STOP"), "GITHUB_ENV": str(t / "github.env"), "OPENBLACK_ENV": str(t / "openblack.env"),
                   "GH_BIN": f"{Path(sys.executable).as_posix()} {(HERE / 'fake_gh.py').as_posix()}",
-                  "FEEDBACK_DIR": str(t / "feedback")})
+                  "FEEDBACK_DIR": str(t / "feedback"),
+                  # the hospital's guards have their own tests below (HospitalGuardTests)
+                  "REQUIRE_DISCHARGE": "false", "INTEGRITY": "", "CASES_DIR": str(t / "cases")})
         c.update(over)
         return c
 
@@ -237,7 +239,7 @@ class RepoTests(unittest.TestCase):
     def test_code_and_data_go_out_as_two_prs(self):
         head = self.add_worker("mixed", {"src/a.cpp": "int a = 2;\n", "config/BW1W120/symbols.txt": "a = 1;\n"})
         self.add_worker("stray", {"src/a.cpp": "int a = 3;\n", "docs/notes.md": "x\n"})
-        pub = P.Publisher(self.cfg(), dry_run=True)
+        pub = P.Publisher(self.cfg(QUALITY_GATE="false"), dry_run=True)  # config/ is a protected path for the gate
         pub.guards()
         pub.cmd_publish()
         log = (self.t / "pub.log").read_text()
@@ -319,6 +321,107 @@ class RepoTests(unittest.TestCase):
         pub2.guards()
         pub2.cmd_comments()
         self.assertEqual(len((self.t / "comments/comments.jsonl").read_text().splitlines()), 3)
+
+    # --- the hospital's guards ------------------------------------------------------------------
+
+    def make_case(self, name, cid="c1", hold=False, discharge=None, chief=None, start=""):
+        d = self.t / "cases" / cid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "case.json").write_text(json.dumps({"id": cid, "fellow": name, "hold": hold, "created": "2026-10-12",
+                                                 "start": start, "base": "", "rounds": 1, "reviews": [
+                                                     {"kind": "code", "worker": f"att-{cid}-2", "verdict": "APPROVE",
+                                                      "file": "review-code-1.md"}]}))
+        for f in ("discharge.json", "chief.json"):
+            (d / f).unlink(missing_ok=True)
+        if discharge is not None:
+            (d / "discharge.json").write_text(json.dumps(discharge))
+        if chief is not None:
+            (d / "chief.json").write_text(json.dumps(chief))
+        (d / "plan.md").write_text("# Plan\n\n## Approach\n\nUse CLAMP.\n")
+        (d / "checklist.md").write_text("# Discharge checklist\n\n| Gate | ok |\n")
+        (d / "review-code-1.md").write_text("Verdict: APPROVE\n")
+        return d
+
+    def publish_log(self, **cfg):
+        (self.t / "pub.log").write_text("")
+        pub = P.Publisher(self.cfg(**cfg), dry_run=True)
+        pub.guards()
+        pub.cmd_publish()
+        return (self.t / "pub.log").read_text()
+
+    def test_hospital_require_discharge(self):
+        head = self.add_worker("fellow1", {"src/b.cpp": "int b = 1;\n"})
+        self.assertIn("skip fellow1: no hospital case", self.publish_log(REQUIRE_DISCHARGE="true"))
+        self.make_case("fellow1")
+        self.assertIn("skip fellow1: case c1 has no passed discharge", self.publish_log(REQUIRE_DISCHARGE="true"))
+        self.make_case("fellow1", discharge={"head": "f" * 40, "passed": True})
+        self.assertIn("skip fellow1: case c1 has no passed discharge", self.publish_log(REQUIRE_DISCHARGE="true"))
+        self.make_case("fellow1", discharge={"head": head, "passed": False})
+        self.assertNotIn(f"-fellow1-{head[:7]}", self.publish_log(REQUIRE_DISCHARGE="true"))
+        self.make_case("fellow1", discharge={"head": head, "passed": True})
+        self.assertIn(f"-fellow1-{head[:7]}", self.publish_log(REQUIRE_DISCHARGE="true"))
+
+    def test_hospital_hold_needs_the_chief_to_release_this_head(self):
+        head = self.add_worker("fellow1", {"src/b.cpp": "int b = 1;\n"})
+        self.make_case("fellow1", hold=True, discharge={"head": head, "passed": True})
+        log = self.publish_log(REQUIRE_DISCHARGE="true")
+        self.assertIn("skip fellow1: case c1 is on hold", log)
+        self.assertNotIn(f"-fellow1-{head[:7]}", log)
+        self.make_case("fellow1", hold=True, discharge={"head": head, "passed": True}, chief={"release": ["0" * 40]})
+        self.assertNotIn(f"-fellow1-{head[:7]}", self.publish_log(REQUIRE_DISCHARGE="true"))
+        self.make_case("fellow1", hold=True, discharge={"head": head, "passed": True}, chief={"release": [head]})
+        self.assertIn(f"-fellow1-{head[:7]}", self.publish_log(REQUIRE_DISCHARGE="true"))
+        self.make_case("fellow1", hold=True)  # a held case is not published even with REQUIRE_DISCHARGE off
+        self.assertIn("skip fellow1: case c1 is on hold", self.publish_log())
+
+    def write_env(self, **over):
+        env = self.t / "publisher.env"
+        env.write_text("".join(f"{k}={v}\n" for k, v in self.cfg(**over).items()))
+        return env
+
+    def test_hospital_integrity_mismatch_publishes_nothing(self):
+        guarded = self.t / "gate.py"
+        guarded.write_text("print('gate')\n")
+        manifest = self.t / "integrity.json"
+        manifest.write_text(json.dumps({"files": {guarded.as_posix(): P.integrity.sha256(guarded)}}))
+        self.assertIn("would push", self.publish_log(INTEGRITY=str(manifest)))  # matches: publishes as before
+        guarded.write_text("print('gate, weakened')\n")
+        with self.assertRaises(P.Refused):
+            self.publish_log(INTEGRITY=str(manifest))
+        self.assertNotIn("would push", (self.t / "pub.log").read_text())
+        self.assertEqual(P.main(["--config", str(self.write_env(INTEGRITY=str(manifest))), "--dry-run"]), 3)
+        manifest.unlink()
+        with self.assertRaises(P.Refused):  # no manifest at all: refused too
+            self.publish_log(INTEGRITY=str(manifest))
+
+    def test_hospital_gate_refusals_are_recorded(self):
+        head = self.add_worker("fieldy", {"src/b.cpp": "void Thing::Real()\n{\n\tthis->field_0x4 = 1;\n}\n"})
+        pub = P.Publisher(self.cfg(), dry_run=True)
+        pub.guards()
+        workers = lambda: {x["name"]: x for x in json.loads((self.t / "workers.json").read_text())["workers"]}
+        state = {}
+        self.assertFalse(pub.publish_one(workers()["fieldy"], state, "fork"))
+        self.assertEqual(state["rejected"]["fieldy"]["head"], head)
+        self.assertIn("quality gate: 2 hard failure(s)", state["rejected"]["fieldy"]["why"])  # field-name, helper
+        # config/ is protected: refused unless the Chief allowed it for this head
+        mixed = self.add_worker("mixed", {"src/a.cpp": "int a = 2;\n", "config/BW1W120/symbols.txt": "a = 1;\n"})
+        self.assertFalse(pub.publish_one(workers()["mixed"], state, "fork"))
+        self.assertIn("protected paths", state["rejected"]["mixed"]["why"])
+        self.make_case("mixed", chief={"allow_paths": {mixed: ["config/BW1W120/symbols.txt"]}})
+        state = {}
+        self.assertTrue(pub.publish_one(workers()["mixed"], state, "fork"))
+        self.assertNotIn("rejected", state)
+
+    def test_hospital_pr_body_has_plan_reviews_checklist_and_warnings(self):
+        d = self.make_case("fellow1")
+        pub = P.Publisher(self.cfg(), dry_run=True)
+        case = {**json.loads((d / "case.json").read_text()), "dir": d}
+        warn = P.quality_gate.Finding("magic-float", "src/b.cpp", 7, "x = 13.8f;", "13.8f")
+        pub.current = {"case": case, "warnings": [warn]}
+        body = pub.body({"name": "fellow1", "result": {}}, ["abc fix"], "a" * 40, "b" * 40, ["src/b.cpp"], 3)
+        for want in ("### Hospital case `c1`", "Discharge checklist", "Use CLAMP.", "Code review by att-c1-2: APPROVE",
+                     "### Quality gate warnings (1)", "`magic-float` src/b.cpp:7 (13.8f)"):
+            self.assertIn(want, body)
 
     def test_reply(self):
         body = self.t / "body.md"

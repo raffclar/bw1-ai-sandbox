@@ -12,6 +12,16 @@ Commands:
             refuse game files / LFS pointers / paths outside ALLOWED_PATHS / oversized changes, push it
             unchanged as a NEW branch <BRANCH_PREFIX><date>-<name>-<sha7> to FORK_REPO, open a draft PR on
             the PR target. Limits per target: MAX_PRS_PER_DAY, MAX_OPEN_PRS. Stop file honoured.
+            The hospital's guards (hospital.py) come first:
+              * INTEGRITY: the root-owned manifest must match the gate, hospital and hook files, or nothing at
+                all is published this run;
+              * REQUIRE_DISCHARGE (default true): a worker is published only when it is the Fellow of a hospital
+                case whose discharge.json passed for exactly this head (skipped, not rejected, until then);
+              * a case on hold is skipped until the Chief releases this exact head (root-owned chief.json);
+              * QUALITY_GATE (default true): quality_gate.py on base..head; hard failures are refused and recorded
+                in state.rejected, warnings are listed in the PR body. Protected paths (config/**, tools/**, ...)
+                are hard failures unless they are exactly as at the case's start or the Chief allowed them for
+                this head, which ends the old automatic code/data split for anything not approved.
   comments  list new conversation comments, review comments and reviews (plus commit status and Actions
             runs of the head) on the open harness PRs of both targets since the last check, and store them.
             With FEEDBACK_TO_SANDBOX=true, new comments from FEEDBACK_AUTHORS are queued as follow-up
@@ -42,6 +52,10 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import integrity  # noqa: E402
+import quality_gate  # noqa: E402
 
 DEFAULTS = {
     "EXPORT": "/var/lib/bw1-sandbox/export/workers.json",
@@ -76,6 +90,11 @@ DEFAULTS = {
     "FEEDBACK_TO_SANDBOX": "false",
     "FEEDBACK_DIR": "/var/lib/bw1-sandbox/feedback",
     "FEEDBACK_AUTHORS": "",
+    # The hospital (hospital.py): cases and their discharge records, the integrity manifest, the quality gate
+    "REQUIRE_DISCHARGE": "true",
+    "CASES_DIR": "/var/lib/bw1-sandbox/cases",
+    "INTEGRITY": "/etc/bw1-sandbox/integrity.json",
+    "QUALITY_GATE": "true",
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -212,6 +231,7 @@ class Publisher:
         self.today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
         self.guard = GhGuard(cfg["FORK_REPO"], cfg["UPSTREAM_REPO"], cfg["BRANCH_PREFIX"])
         self._harness_cache = {}
+        self.current = {}  # the worker being published: its hospital case and quality gate warnings
 
     # --- plumbing -------------------------------------------------------------------------------
 
@@ -390,6 +410,23 @@ class Publisher:
             self.log(f"REFUSED {name}: adds `extern` (the project never uses it): {externs[:5]}")
             state.setdefault("rejected", {})[name] = {"head": head, "why": f"adds extern: {externs[:5]}"}
             return False
+        case = self.case_for(name)
+        if not self.case_allows(name, head, case):
+            return False
+        self.current = {"case": case, "warnings": []}
+        if self.flag("QUALITY_GATE"):
+            findings = quality_gate.run(self.cfg["PUBLISH_CLONE"], base, head,
+                                        allow_from=(case or {}).get("start", ""),
+                                        allow_paths=self.chief_allowed(case, head))
+            hard = [f for f in findings if f.level == "hard"]
+            if hard:
+                listed = [f"{f.rule} {f.path}" + (f":{f.line}" if f.line else "") for f in hard]
+                esc = " (protected paths: the Chief decides)" if quality_gate.escalations(findings) else ""
+                self.log(f"REFUSED {name}: quality gate, {len(hard)} hard failure(s){esc}: {listed[:8]}")
+                state.setdefault("rejected", {})[name] = {
+                    "head": head, "why": f"quality gate: {len(hard)} hard failure(s){esc}: {listed[:10]}"}
+                return False
+            self.current["warnings"] = [f for f in findings if f.level == "warn"]
         if not data:
             # One commit on upstream main, by the configured author, rather than the worker's own commits
             commit = self.part_commit(base, head, files, name, "code", commits)
@@ -416,6 +453,65 @@ class Publisher:
         if not self.dry:
             state.setdefault("published", {})[name] = {"head": head, "parts": published}
         return True
+
+    # --- hospital ---------------------------------------------------------------------------
+
+    def flag(self, key: str) -> bool:
+        return str(self.cfg.get(key, "")).strip().lower() in ("1", "true", "yes", "on")
+
+    def case_for(self, name: str):
+        """The newest hospital case whose Fellow is this worker, as {..., "dir": Path}, or None."""
+        root = Path(self.cfg.get("CASES_DIR") or "/nonexistent")
+        best = None
+        for f in sorted(root.glob("*/case.json")) if root.is_dir() else []:
+            try:
+                c = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if c.get("fellow") == name and (best is None or c.get("created", "") >= best.get("created", "")):
+                best = {**c, "dir": f.parent}
+        return best
+
+    @staticmethod
+    def chief(case) -> dict:
+        """The Chief's root-owned overrides for a case (anything else counts for nothing)."""
+        if not case:
+            return {}
+        p = Path(case["dir"]) / "chief.json"
+        if not p.is_file() or not integrity.root_owned(p):
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+
+    def chief_allowed(self, case, head: str) -> list:
+        return list((self.chief(case).get("allow_paths") or {}).get(head, []))
+
+    def case_allows(self, name: str, head: str, case) -> bool:
+        """Hold and discharge: a False here is a skip (retried next run), not a rejection."""
+        if case and case.get("hold") and head not in (self.chief(case).get("release") or []):
+            self.log(f"skip {name}: case {case['id']} is on hold (the Chief releases a head with "
+                     f"`hospital.py release {case['id']} --head {head}`)")
+            return False
+        if not self.flag("REQUIRE_DISCHARGE"):
+            return True
+        if not case:
+            self.log(f"skip {name}: no hospital case (REQUIRE_DISCHARGE: only discharged cases are published)")
+            return False
+        try:
+            d = json.loads((Path(case["dir"]) / "discharge.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            d = {}
+        if d.get("head") != head or d.get("passed") is not True:
+            self.log(f"skip {name}: case {case['id']} has no passed discharge for {head[:10]}"
+                     + (f" (last: {str(d.get('head'))[:10]}, passed {d.get('passed')})" if d else ""))
+            return False
+        return True
+
+    def integrity_problems(self) -> list:
+        path = self.cfg.get("INTEGRITY", "")
+        return integrity.verify(Path(path)) if path else []
 
     def globs(self, key: str) -> list:
         return [p.strip() for p in self.cfg.get(key, "").split(",") if p.strip()]
@@ -554,16 +650,64 @@ class Publisher:
         ]
         if text:
             out += ["### Worker's final summary (unreviewed, written by the agent)", "", "```", text, "```", ""]
+        out += self.hospital_body()
+        if (self.current or {}).get("case") and self.flag("REQUIRE_DISCHARGE"):  # discharged for this head
+            out += [
+                "### Verification",
+                "",
+                "The publisher itself builds nothing. The hospital's Discharge Nurse rebuilt this head in a throwaway "
+                "container without network, with `tools/` and `configure.py` from the base, and found no regression "
+                "against a baseline built at the base (checklist above). A human still reviews it against AGENTS.md "
+                "before marking it ready.",
+                "",
+            ]
+        else:
+            out += [
+                "### Not verified",
+                "",
+                "The publisher does not build or run worker code on the droplet. Workers check their own matches "
+                "with the repo's tools inside their containers, but nobody has reviewed this. Run "
+                "`tools/decomp-verify.py` and read the diff against AGENTS.md before marking it ready.",
+                "",
+            ]
         out += [
-            "### Not verified",
-            "",
-            "The publisher does not build or run worker code on the droplet. Workers check their own matches "
-            "with the repo's tools inside their containers, but nobody has reviewed this. Run "
-            "`tools/decomp-verify.py` and read the diff against AGENTS.md before marking it ready.",
-            "",
             "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)",
         ]
         return "\n".join(out)
+
+    def hospital_body(self) -> list:
+        """The case's plan, reviews and discharge checklist, and the quality gate's warnings."""
+        current = getattr(self, "current", None) or {}
+        case, warnings = current.get("case"), current.get("warnings") or []
+        out = []
+
+        def doc(title, name, limit=12000):
+            try:
+                text = (Path(case["dir"]) / name).read_text(encoding="utf-8").strip()
+            except OSError:
+                return []
+            if len(text) > limit:
+                text = text[:limit] + "\n\n(truncated)"
+            return ["<details>", f"<summary>{title}</summary>", "", text.replace("```", "'" * 3), "", "</details>", ""]
+
+        if case:
+            out += [f"### Hospital case `{case['id']}`", "",
+                    f"Fellow `{case.get('fellow')}`, {case.get('rounds', 0)} rework round(s); base "
+                    f"`{str(case.get('base'))[:10]}`, start `{str(case.get('start'))[:10]}`. Reviewed by separate "
+                    "Attending workers and checked by the deterministic Discharge Nurse (pristine build with the "
+                    "base's tools, no network).", ""]
+            out += doc("Discharge checklist", "checklist.md")
+            out += doc("Approved plan", "plan.md")
+            for r in case.get("reviews", []):
+                out += doc(f"{r['kind'].capitalize()} review by {r['worker']}: {r['verdict']}", r["file"], 8000)
+        if warnings:
+            out += [f"### Quality gate warnings ({len(warnings)})", "",
+                    "Not blocking; a reviewer should still look at them.", ""]
+            out += [f"- `{w.rule}` {w.path}:{w.line}" + (f" ({w.detail})" if w.detail else "") for w in warnings[:80]]
+            if len(warnings) > 80:
+                out.append(f"- ... and {len(warnings) - 80} more")
+            out.append("")
+        return out
 
     def cmd_publish(self) -> int:
         target = self.cfg["PR_TARGET"]
@@ -581,6 +725,9 @@ class Publisher:
                  f"(PR target: {target} = {self.target_repo(target)})")
         if not todo:
             return 0
+        problems = self.integrity_problems()
+        if problems:
+            raise Refused(f"integrity check failed, publishing nothing: {problems[:5]}")
         open_count = len(self.open_harness_prs(target))
         if not self.dry:
             self.git("fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")

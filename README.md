@@ -249,7 +249,15 @@ On a timer (`publish_interval`, 30 min), as the `publisher` user:
 3. **Fetch.** It fetches each one from the sandbox clone into its own bare clone. Only objects and refs come across,
    so worker code is **never built or run** on the host.
 4. **Refuse.** It rejects anything that touches `orig/`, `.gitattributes` or LFS pointers, any change outside
-   `allowed_paths`, and changes over 40 files or 4000 lines.
+   `allowed_paths`, and changes over 40 files or 4000 lines. Then the hospital's guards (next section):
+   * nothing at all is published while `/etc/bw1-sandbox/integrity.json` does not match the harness files;
+   * with `REQUIRE_DISCHARGE=true` (the default) a worker is published only as the Fellow of a hospital case whose
+     `discharge.json` passed for exactly this head; a case on hold waits until the Chief releases that head
+     (skipped, not rejected, until then);
+   * the quality gate runs on base..head: hard failures are rejected and recorded in `state.json`'s `rejected`, and
+     the warnings are listed in the PR body, with the case's plan, reviews and discharge checklist. Protected paths
+     (`config/**` and the rest) count as hard failures unless they are exactly as at the case's start or the Chief
+     allowed them for this head, so the automatic code/data split now only happens for approved data.
 5. **Push.** It pushes the commits unchanged as a **new** branch, `ai-sandbox/<date>-<name>-<sha7>`, to
    `raffclar/bw1-decomp` only.
 6. **Open a draft PR** on the PR target, base `main`:
@@ -276,6 +284,44 @@ anyone's comments.
   its follow-up prompt;
 * comments from anyone else are stored but never reach a worker. On public openblack PRs anyone can comment, so
   widening `feedback_authors` lets strangers prompt your workers.
+
+## Quality gate, hooks and the hospital
+
+**The gate** (`droplet/quality_gate.py`) checks the lines a change adds against bwrsandman's review rules from
+PR #431 and AGENTS.md, plus anti-cheat rules: inline assembly, `_emit`, section and linker pragmas, bytes cast to
+functions, and any change to protected paths (build files, `config/**`, `tools/**`, the agent rules and hooks),
+which also escalates to the Chief. It reads git objects only. It runs in three places: as each worker's git
+pre-commit hook (`--staged`), as the workers' Claude Stop hook (blocks once), and on the host in the Discharge Nurse
+and the publisher.
+
+**Worker setup** (`sandbox.droplet.toml`'s `setup`, new workers only) unpacks `droplet/hooks` and the gate into
+`~/.claude/hooks/` and runs `install_hooks.py`: the hooks, the git pre-commit hook and
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=42` (compaction at 42% of the context window), then a self-check. For an existing
+worker, run it on the host as root:
+
+```sh
+python3 /opt/bw1-sandbox/droplet/hooks/install_hooks.py --home /srv/decomp/workers/NAME/home \
+  --repo /srv/decomp/workers/NAME/repo --container-home /home/agent --chown 2000:2000
+```
+
+**The preamble** workers get is `preamble.droplet.md`: upstream's `preamble.md` with `droplet/preamble-droplet.md`
+(the 13 maintainer rules, the forbidden constructs and the hospital rules) inserted before "## Task".
+
+**The hospital** (`bw1-hospital`, i.e. `droplet/hospital.py`; see its docstring) takes one change through triage,
+the Fellow's workup (a plan, no code), a plan review by a new Attending worker, treatment, a code review by another
+new Attending, and the deterministic Discharge Nurse, whose pristine build runs in a `--network none` container with
+the base's `tools/` and `configure.py`. Cases live in `/var/lib/bw1-sandbox/cases/<id>/`. The Chief (you, as root)
+handles escalations (`bw1-hospital status`), the precedent log every prompt includes (`bw1-hospital precedent`),
+releases of held cases (`release`), protected-path approvals (`allow-paths`) and `resolve`. The charge timer
+(`bw1-hospital-charge.timer`) advances open cases every 15 minutes; setup installs it disabled.
+
+Limit: upstream mounts every worker folder read-only at `/peers` in every worker, so only its instructions keep an
+Attending out of the Fellow's transcript (`/peers/<fellow>/home/agent.jsonl`).
+
+**Tamper protection:** setup writes `/etc/bw1-sandbox/integrity.json` (root-owned) with the hashes of the gate,
+`hospital.py`, `integrity.py`, the publisher, the hooks and the hospital's prompts. The publisher and the Discharge
+Nurse refuse on any mismatch, and the Discharge Nurse also compares the Fellow's installed hooks. After changing
+any of those files, re-run `python3 /opt/bw1-sandbox/droplet/integrity.py write` as root.
 
 ## Switching it on
 
