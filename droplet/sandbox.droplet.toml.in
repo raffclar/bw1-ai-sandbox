@@ -77,7 +77,7 @@ if m:
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.touch()
 log = pathlib.Path(".ninja_log")
-lines = [] if log.exists() else ["# ninja log v5"]
+lines = [] if log.exists() else ["# ninja log v6"]  # the image's ninja 1.12 discards a v5 log
 for out in re.findall(r"^build (\S+): (?:download_tool|patch_headers)\s", ninja, re.M):
     if os.path.exists(out):
         command = subprocess.run(["ninja", "-t", "commands", "-s", out], capture_output=True, text=True,

@@ -56,6 +56,11 @@ class RenderTests(unittest.TestCase):
         for rel in R.HOOK_SOURCES:
             self.assertEqual(files[Path(rel).name], (DROPLET / rel).read_bytes(), rel)
         self.assertEqual(R.hooks_bundle(), R.hooks_bundle())  # reproducible
+        # The worker image's ninja (1.12) discards a v5 log ("build log version is too old; starting over") and
+        # then re-downloads the toolchain with no network: a fresh tree's log must be v6 (pr431's discharge, 2026-10-12)
+        setup = cfg["worker"]["setup"][2]
+        self.assertIn('["# ninja log v6"]', setup)
+        self.assertNotIn("ninja log v5", setup)
         with self.assertRaises(SystemExit):
             R.render_toml("x = @MISSING@", {})
 
