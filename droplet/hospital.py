@@ -43,7 +43,8 @@ STOP files
 Loops and circuit breaker
   plan rejected -> workup; changes requested or discharge failed -> treatment; more than 3 rework rounds -> escalate.
   A stalled stage (the worker exited without its artifact) is re-run by `advance`/`charge` up to 2 times, then
-  escalates. A case delta over 1000 lines escalates: it must be split. A tamper-path finding or an integrity mismatch
+  escalates. A run that ended on the account's usage limit is not a stall: `advance` waits for the reset (the
+  sandbox's autoresume continues the worker) and, 15 minutes past it, continues the worker itself. A case delta over 1000 lines escalates: it must be split. A tamper-path finding or an integrity mismatch
   escalates at once.
 
 State: /var/lib/bw1-sandbox/cases/<id>/ (case.json, case.md, plan.md, reviews, checklist.md, discharge.json,
@@ -77,6 +78,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -97,6 +99,10 @@ IMAGE = "bw1-worker"
 MAX_ROUNDS = 3  # rework rounds; the 4th escalates
 MAX_RERUNS = 2  # re-runs of a stalled stage; the 3rd stall escalates
 MAX_DELTA = 1000  # changed lines from the case's start; more must be split
+LIMIT_GRACE = 15 * 60  # after a usage-limit reset, the sandbox's autoresume gets this long before the hospital resumes
+CONTINUE_PROMPT = ("Your last run stopped on the account's usage limit, which has reset. Continue your task from "
+                   "where you stopped: check your branch and working tree first (`git status`, `git log`), finish "
+                   "the stage's work and write its artifact.")
 # The Discharge container's caps. The droplet has 8 vCPUs and 16 GB; each worker gets 2 CPUs and 4g. Half the CPUs,
 # and 5g, leave two running workers (8g), the host and Ghidra (~2.5g) their memory (the Chief, 2026-10-12).
 DISCHARGE_CPUS = float(os.environ.get("DISCHARGE_CPUS", "4"))
@@ -194,6 +200,13 @@ class SandboxWard:
 
     def running(self, name: str) -> bool:
         return name in self.sb.running_workers()
+
+    def limited(self, name: str):
+        """The worker's last run ended on the account's usage limit: {"resetsAt": epoch or None, ...}, else None."""
+        for w in self.sb.workers():
+            if w.get("name") == name:
+                return w.get("limited") or None
+        return None
 
     def exists(self, name: str) -> bool:
         return name in self.sb.worker_names()
@@ -725,6 +738,10 @@ class Hospital:
         self.event(c, f"launched {worker} ({stage}, attempt {c['running']['attempt']})")
         return f"{c['id']}: launched {worker} for {stage}"
 
+    def models_for(self, c: dict, worker: str):
+        models = c.get("models") or {}
+        return (models.get("fellow" if worker == c["fellow"] else "attending", ""), c.get("effort", ""))
+
     def escalate(self, c: dict, why: str) -> str:
         c["escalations"].append({"at": now(), "stage": c["stage"], "why": why, "open": True})
         c["stage"], c["running"] = "escalated", None
@@ -833,8 +850,21 @@ class Hospital:
             return f"{cid}: {c['stage']}"
         out = []
         if c.get("running"):
-            if self.ward.running(c["running"]["worker"]):
-                return f"{cid}: waiting for {c['running']['worker']} ({c['stage']})"
+            worker = c["running"]["worker"]
+            if self.ward.running(worker):
+                return f"{cid}: waiting for {worker} ({c['stage']})"
+            limit = self.ward.limited(worker) if hasattr(self.ward, "limited") else None
+            if limit:
+                # The run ended on the account's usage limit, not with its artifact: never a stall. Wait for the
+                # reset (the sandbox's autoresume continues the worker); well past it, continue the worker here.
+                resets = limit.get("resetsAt") or 0
+                if not resets or time.time() < resets + LIMIT_GRACE:
+                    when = datetime.fromtimestamp(resets, timezone.utc).strftime("%H:%M UTC") if resets else "?"
+                    return f"{cid}: {worker} stopped on the usage limit (resets {when}); waiting"
+                self.ward.resume(worker, CONTINUE_PROMPT, *self.models_for(c, worker))
+                self.event(c, f"continued {worker} after the usage limit reset")
+                self.save(c)
+                return f"{cid}: continued {worker} after the usage limit reset"
             out.append(self.evaluate(c))
             self.save(c)
         if c["stage"] == "discharge":

@@ -61,12 +61,16 @@ class FakeWard:
         self.calls = []
         self.on = {}  # stage kind -> fn(ward, worker, prompt)
         self.busy = set()
+        self.limits = {}
 
     def exists(self, name):
         return name in self.files
 
     def running(self, name):
         return name in self.busy
+
+    def limited(self, name):
+        return self.limits.get(name)
 
     @staticmethod
     def kind(prompt):
@@ -601,6 +605,25 @@ class HospitalTests(unittest.TestCase):
         self.triage(cid="other")
         out = self.hosp.charge()
         self.assertEqual(len(out), 2)
+
+    def test_a_usage_limit_is_waited_out_not_counted_as_a_stall(self):
+        import time as _time
+        self.triage()
+        self.ward.on["workup"] = lambda w, n, p: None  # the run ends on the limit, with no plan
+        self.hosp.advance("pr431")
+        self.ward.limits["first"] = {"resetsAt": int(_time.time()) + 3600}
+        for _ in range(5):
+            self.assertIn("stopped on the usage limit", self.hosp.advance("pr431"))
+        c = self.hosp.load("pr431")
+        self.assertEqual((c["stage"], c.get("rerun", 0)), ("workup", 0))
+        # well past the reset and nobody resumed it: the hospital continues the same worker (no new stall)
+        self.ward.limits["first"] = {"resetsAt": int(_time.time()) - 3600}
+        self.ward.on["workup"] = lambda w, n, p: w.files[n].__setitem__("home/case/plan.md", PLAN.encode())
+        self.assertIn("continued first", self.hosp.advance("pr431"))
+        self.assertEqual(self.ward.calls[-1][2], H.CONTINUE_PROMPT)
+        self.ward.limits.pop("first")
+        self.ward.files["first"]["home/case/plan.md"] = PLAN.encode()  # the continued run wrote its plan
+        self.assertIn("to plan review", self.hosp.advance("pr431"))
 
     def test_status_survives_a_ward_that_cannot_reach_the_sandbox(self):
         self.triage()
