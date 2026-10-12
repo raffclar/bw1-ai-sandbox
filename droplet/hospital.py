@@ -690,7 +690,7 @@ class Hospital:
 
     def common(self, c: dict) -> dict:
         return dict(CASE_ID=c["id"], FELLOW=c["fellow"], BASE=c["base"], START=c.get("start") or c["base"],
-                    ROUND=c["rounds"] + 1, PRECEDENTS=self.precedents(), CASE_MD=self.get(c["id"], "case.md").strip(),
+                    ROUND=c["rounds"] + 1, PRECEDENTS=self.precedents() + self.accepted_floors(c["id"]), CASE_MD=self.get(c["id"], "case.md").strip(),
                     PLAN_MD=self.get(c["id"], "plan.md").strip() or "(no plan)", GATE_CMD=self.gate_cmd(c),
                     ATTEMPT_NOTE=self.attempt_note(c), FEEDBACK=self.feedback(c),
                     PLAN_TEMPLATE=self.template("plan-template.md", CASE_ID=c["id"]).strip(),
@@ -741,6 +741,17 @@ class Hospital:
     def models_for(self, c: dict, worker: str):
         models = c.get("models") or {}
         return (models.get("fellow" if worker == c["fellow"] else "attending", ""), c.get("effort", ""))
+
+    def accepted_floors(self, cid: str) -> str:
+        """The Chief's accepted floors for this case, for every prompt (the latest per unit and metric counts)."""
+        latest = {}
+        for o in self.chief(cid).get("floor_overrides") or []:
+            latest[(o.get("unit"), o.get("metric"))] = o
+        if not latest:
+            return ""
+        rows = [f"- {u} {m} >= {o.get('value')} ({o.get('ref')})" for (u, m), o in latest.items()]
+        return ("\n\nThis case's accepted floors (the Chief's rulings; discharge checks these instead of the start, "
+                "and a loss down to them is decided, not a finding):\n" + "\n".join(rows))
 
     def escalate(self, c: dict, why: str) -> str:
         c["escalations"].append({"at": now(), "stage": c["stage"], "why": why, "open": True})

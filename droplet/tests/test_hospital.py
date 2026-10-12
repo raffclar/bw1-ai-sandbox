@@ -637,6 +637,19 @@ class HospitalTests(unittest.TestCase):
 
     # --- progress (the Chief, 2026-10-12: discharge needs progress, else the Chief decides) ----------------
 
+    def test_every_prompt_carries_the_accepted_floors(self):
+        self.triage()
+        self.hosp._root = True
+        self.hosp.accept_floor("pr431", "Thing", "section:.bss", "97.20", "R13")
+        self.hosp.accept_floor("pr431", "Thing", "section:.bss", "96.26", "R7 ruling")  # the later one counts
+        self.hosp._root = False
+        self.run_until_closed()
+        prompts = [p for k, n, p in self.ward.calls if k in ("spawn", "resume")]
+        self.assertTrue(prompts)
+        for p in prompts:
+            self.assertIn("- Thing section:.bss >= 96.26 (R7 ruling)", p)
+            self.assertNotIn(">= 97.20", p)
+
     def test_discharge_records_progress_and_measures_the_start_once(self):
         self.triage(floors={"Thing": 157})
         out = self.run_until_closed()
