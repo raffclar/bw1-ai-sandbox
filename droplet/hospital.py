@@ -223,7 +223,9 @@ class SandboxWard:
                         f"{sha}:refs/heads/case/{case_id}"], env=self.sb.git_env, check=True)
         self.sb.agent("update_workers")
         w = f"{WORKERS}/{name}"
-        as_worker = ["sudo", "-u", "#2000", "-g", "#2000", "env", f"HOME={w}/home", "git", "-C", f"{w}/repo"]
+        # uid 2000 has no passwd entry on the droplet, so `sudo -u '#2000'` is refused; setpriv needs none
+        as_worker = ["sudo", "setpriv", "--reuid=2000", "--regid=2000", "--clear-groups", "env", f"HOME={w}/home",
+                     "git", "-C", f"{w}/repo"]
         _, dirty, _ = self.sb.exec(as_worker + ["status", "--porcelain"])
         if dirty.strip():
             raise HospitalError(f"worker {name} has uncommitted changes; not moving its branch")
@@ -555,7 +557,11 @@ class Hospital:
              "effort": effort, "created": now(), "feedback": "", "reviews": [], "reviewed_head": "",
              "plan_review": "", "code_review": "", "floors": dict(floors or {})}
         if start and self.ward.head(fellow) != start:
-            old_head = self.ward.start_from(fellow, start, cid)
+            try:
+                old_head = self.ward.start_from(fellow, start, cid)
+            except Exception as e:  # leave no half-made case behind, so the triage can simply be re-run
+                shutil.rmtree(d, ignore_errors=True)
+                raise HospitalError(f"could not move {fellow} to {start[:10]}: {e}")
             c["old_head"] = old_head
         case_md = "\n".join([
             f"# Case {cid}: {c['title']}", "",

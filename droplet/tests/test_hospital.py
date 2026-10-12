@@ -215,6 +215,50 @@ class HospitalTests(unittest.TestCase):
         with self.assertRaises(H.HospitalError):
             self.triage()  # exists
 
+    def test_a_failed_start_leaves_no_case_behind(self):
+        def fail(*a):
+            raise RuntimeError("sudo: unknown user #2000")
+        self.ward.start_from = fail
+        with self.assertRaises(H.HospitalError):
+            self.triage()
+        self.assertFalse((self.cases / "pr431").exists())
+        del self.ward.start_from
+        self.assertEqual(self.triage()["old_head"], self.old)  # the triage can simply be re-run
+
+    def test_sandbox_ward_runs_git_as_the_worker_uid_with_setpriv(self):
+        calls = []
+
+        class SB:
+            git_env = None
+
+            def need_ip(self):
+                return "127.0.0.1"
+
+            def agent(self, *a, **k):
+                calls.append(("agent",) + a)
+
+            def exec(self, argv, stdin=None):
+                calls.append(tuple(argv))
+                return 0, (b"" if "status" in argv else b"%s\n" % self.old.encode()), b""
+
+        ward = object.__new__(H.SandboxWard)
+        ward.sb, ward.repo = SB(), self.repo
+        ward.sb.old = self.old
+        orig = H.subprocess.run
+        H.subprocess.run = lambda *a, **k: calls.append(("push",) + tuple(a[0][-2:])) if "push" in a[0]             else orig(*a, **k)
+        try:
+            self.assertEqual(ward.start_from("first", self.start, "pr431"), self.old)
+        finally:
+            H.subprocess.run = orig
+        git_calls = [c for c in calls if c[0] == "sudo"]
+        self.assertEqual(len(git_calls), 4)
+        for c in git_calls:
+            self.assertEqual(c[:5], ("sudo", "setpriv", "--reuid=2000", "--regid=2000", "--clear-groups"))
+            self.assertNotIn("-u", c)
+        self.assertIn(("push", "ssh://decomp@127.0.0.1/srv/decomp/mirror.git", f"{self.start}:refs/heads/case/pr431"),
+                      calls)
+        self.assertEqual(git_calls[-1][-4:], ("-q", "-B", "agent/first", "origin/case/pr431"))
+
     def test_full_pipeline_to_discharge(self):
         self.triage()
         out = self.run_until_closed()
