@@ -711,6 +711,16 @@ class HospitalTests(unittest.TestCase):
         self.triage(units=[])
         self.assert_no_progress_escalates("lists no units")
 
+    def test_a_header_only_unit_is_noted_not_failed(self):
+        self.triage(units=["Thing", "InfluenceCircle"])  # InfluenceCircle has no objdiff unit: header only
+        out = self.run_until_closed()
+        self.assertEqual(self.hosp.load("pr431")["stage"], "discharged", "\n".join(out))
+        d = json.loads((self.cases / "pr431/discharge.json").read_text())
+        self.assertEqual(d["progress"]["no_unit"], ["InfluenceCircle"])
+        # a unit in only one of the two reports is still a problem
+        problems, _ = H.progress({"units": ["Thing"]}, self.reports["start"], {"units": []})
+        self.assertIn("Thing: not in the head report", problems)
+
     def test_a_section_below_its_start_escalates(self):
         self.triage()
         self.reports["head"] = report(other=80.0, text=98.0)

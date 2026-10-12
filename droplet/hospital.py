@@ -501,6 +501,9 @@ def progress(c: dict, start_report, head_report, overrides=()):
     problems, record, improved = [], {"units": {}, "improved": []}, []
     for unit in units:
         s_u, h_u = report_unit(start_report, unit), report_unit(head_report, unit)
+        if h_u is None and s_u is None:
+            record.setdefault("no_unit", []).append(unit)  # e.g. a header-only "unit" such as InfluenceCircle
+            continue
         if h_u is None or s_u is None:
             problems.append(f"{unit}: not in the {'head' if h_u is None else 'start'} report")
             continue
