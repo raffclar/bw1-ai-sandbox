@@ -1,0 +1,14 @@
+[Unit]
+Description=bw1 sandbox: hospital charge round (advance every open case: evaluate finished stages, launch the next)
+After=docker.service bw1-egress.service
+ConditionPathExists=!/etc/bw1-sandbox/STOP
+
+[Service]
+Type=oneshot
+User=sandbox
+Group=sandbox
+Environment=SANDBOX_DIR=/opt/bw1-sandbox/bw1-ai-sandbox
+EnvironmentFile=-/etc/bw1-sandbox/hospital.env
+ExecStart=/opt/bw1-sandbox/venv/bin/python3 /opt/bw1-sandbox/droplet/hospital.py charge
+# a discharge runs the full pristine build in a container
+TimeoutStartSec=8h

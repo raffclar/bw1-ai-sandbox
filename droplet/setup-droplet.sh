@@ -136,7 +136,9 @@ say "python environment"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q "docker>=7" paramiko cryptography
 if [[ "$ORCHESTRATOR_TOOLS" == true ]]; then "$VENV/bin/pip" install -q mcp; fi
-chmod 0755 "$DROPLET" "$DROPLET"/*.py "$DROPLET"/*.sh "$DROPLET/pre-push" "$DROPLET/hooks" "$DROPLET"/hooks/*
+chmod 0755 "$DROPLET" "$DROPLET"/*.py "$DROPLET"/*.sh "$DROPLET/pre-push" "$DROPLET/hooks" "$DROPLET"/hooks/* \
+	"$DROPLET/hospital" "$DROPLET/hospital/verify.sh"
+chmod 0644 "$DROPLET"/hospital/*.md
 
 say "bw1-decomp clone ($REPO_SOURCE)"
 # The sandbox's host clone. Remotes: `upstream` = UPSTREAM_REPO (fetch; push DISABLED), `fork` = FORK_REPO
@@ -335,10 +337,36 @@ exec env SANDBOX_DIR=$SB $VENV/bin/python3 $DROPLET/sandbox_droplet.py sandbox "
 EOF
 chmod 0755 /usr/local/bin/bw1-sandbox
 
+say "hospital: cases, precedent log, integrity manifest"
+# Cases are written by the sandbox user and read by the publisher (group sandbox). The folder is root's and sticky,
+# so the sandbox user can add case folders but cannot replace the root-owned precedent log.
+CASES=/var/lib/bw1-sandbox/cases
+install -d -o root -g sandbox -m 1775 "$CASES"
+if [[ ! -f "$CASES/precedents.md" ]]; then
+	printf '# Precedents (the Chief'"'"'s decisions; they bind every case)\n\n' >"$CASES/precedents.md"
+fi
+chown root:root "$CASES/precedents.md"
+chmod 0644 "$CASES/precedents.md"
+printf 'GAME_VERSION=%s\n' "$GAME_VERSION" >"$ETC/hospital.env"
+chmod 0644 "$ETC/hospital.env"
+cat >/usr/local/bin/bw1-hospital <<EOF
+#!/bin/sh
+# The hospital pipeline (droplet/hospital.py): as the sandbox user for cases, as root for the Chief's commands.
+exec env SANDBOX_DIR=$SB GAME_VERSION=$GAME_VERSION $VENV/bin/python3 $DROPLET/hospital.py "\$@"
+EOF
+chmod 0755 /usr/local/bin/bw1-hospital
+# Tamper protection: sha256 of the gate, hospital.py, the hooks, the prompts and the publisher, which the publisher
+# and the Discharge Nurse check before they act. Re-run this step after changing any of them.
+python3 "$DROPLET/integrity.py" write --droplet "$DROPLET" --out "$ETC/integrity.json"
+chown root:root "$ETC/integrity.json"
+chmod 0644 "$ETC/integrity.json"
+python3 "$DROPLET/integrity.py" check --manifest "$ETC/integrity.json"
+
 say "services"
 install -d -o publisher -g sandbox -m 2770 /var/lib/bw1-sandbox/feedback
 for u in bw1-sandbox-autoresume.service bw1-sandbox-portal.service bw1-sandbox-export.service bw1-publisher.service \
-	bw1-publisher-comments.service bw1-publisher-comments.timer bw1-sandbox-feedback.service bw1-sandbox-feedback.timer; do
+	bw1-publisher-comments.service bw1-publisher-comments.timer bw1-sandbox-feedback.service bw1-sandbox-feedback.timer \
+	bw1-hospital-charge.service bw1-hospital-charge.timer; do
 	install -m 0644 "$DROPLET/systemd/$u" /etc/systemd/system/
 done
 sed "s|@PUBLISH_INTERVAL@|$PUBLISH_INTERVAL|" "$DROPLET/systemd/bw1-publisher.timer" >/etc/systemd/system/bw1-publisher.timer
@@ -350,4 +378,6 @@ toggle bw1-publisher.timer "$PUBLISHER_ENABLED"
 toggle bw1-publisher-comments.timer "$PUBLISHER_ENABLED"
 # Off by default: reviewer comments become follow-up prompts for the worker that made the PR.
 toggle bw1-sandbox-feedback.timer "$FEEDBACK_TO_SANDBOX"
+# The hospital's charge timer is installed but never switched on here: the Chief starts it with
+# `systemctl enable --now bw1-hospital-charge.timer` once the pipeline has been tried by hand.
 say "done: no workers are running; spawn them with the orchestrator, the portal or bw1-sandbox spawn"
