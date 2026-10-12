@@ -602,6 +602,15 @@ class HospitalTests(unittest.TestCase):
         out = self.hosp.charge()
         self.assertEqual(len(out), 2)
 
+    def test_status_survives_a_ward_that_cannot_reach_the_sandbox(self):
+        self.triage()
+        self.hosp.advance("pr431")  # a worker is now recorded as running
+
+        def broken(name):
+            raise RuntimeError("ssh to VM failed: no key for root")
+        self.ward.running = broken
+        self.assertIn("first ?", self.hosp.status())
+
 
     # --- progress (the Chief, 2026-10-12: discharge needs progress, else the Chief decides) ----------------
 

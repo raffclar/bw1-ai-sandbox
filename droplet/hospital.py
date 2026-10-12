@@ -1109,7 +1109,11 @@ class Hospital:
             run = c.get("running") or {}
             state = ""
             if run:
-                alive = "?" if self.ward is None else ("running" if self.ward.running(run["worker"]) else "finished")
+                try:
+                    running = self.ward is not None and self.ward.running(run["worker"])
+                    alive = "?" if self.ward is None else ("running" if running else "finished")
+                except Exception:  # e.g. root, who has no sandbox ssh key: the case list still prints
+                    alive = "?"
                 state = f", {run['worker']} {alive}"
             lines.append(f"{i:24} {c['stage']:12} rounds {c['rounds']}/{MAX_ROUNDS}  fellow {c['fellow']}"
                          f"{'  HOLD' if c.get('hold') else ''}{state}  {c['title'][:50]}")
