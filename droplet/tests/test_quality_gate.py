@@ -55,6 +55,21 @@ class GateTests(unittest.TestCase):
     def test_anonymous_enum(self):
         self.assertIn(("anon-enum", "hard"), self.rules({"src/Thing.h": BASE_H.replace("struct", "enum\n{\n\tTHING_COUNT = 8,\n};\nstruct")}))
 
+    def test_module_level_guard_is_allowed_but_not_defined_in_source(self):
+        self.write({"configure.py": 'cflags = ["/DNDEBUG", "/D_LH_3D_LIB_"]\nmp = [*cflags, "/D_LH_MULTIPLAYER_LIB_"]\n'})
+        self.base = self.commit()
+        for macro in ("_LH_3D_LIB_", "_LH_MULTIPLAYER_LIB_"):
+            h = BASE_H.replace("struct Thing {", f"#ifdef {macro}\nstatic int g;\n#endif\nstruct Thing {{")
+            self.assertEqual(self.rules({"src/Thing.h": h}), [], macro)
+        # a per-header macro stays hard, and so does defining the module guard in a source file
+        h = BASE_H.replace("struct Thing {", "#ifdef LAND_CELL_DARKNESS_COLOURS\nstatic int g;\n#endif\nstruct Thing {")
+        self.assertIn(("header-toggle", "hard"), self.rules({"src/Thing.h": h}))
+        self.assertIn(("header-toggle", "hard"),
+                      self.rules({"src/Thing.cpp": '#define _LH_3D_LIB_\n#include "Thing.h"\n\nvoid Thing::Real()\n{\n}\n'}))
+        # a _LH_..._LIB_ name configure.py does not define is just a new macro
+        h = BASE_H.replace("struct Thing {", "#ifdef _LH_GAME_LIB_\nstatic int g;\n#endif\nstruct Thing {")
+        self.assertIn(("header-toggle", "hard"), self.rules({"src/Thing.h": h}))
+
     def test_header_toggle(self):
         h = BASE_H.replace("struct Thing {", "#ifdef THING_EXTRA\nstatic int g;\n#endif\nstruct Thing {")
         self.assertIn(("header-toggle", "hard"), self.rules({"src/Thing.h": h}))

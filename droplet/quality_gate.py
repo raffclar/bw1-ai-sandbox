@@ -11,7 +11,11 @@ With --json the summary also says whether the change must escalate to the Chief 
 Hard failures (a commit, a review and the publisher refuse them):
   anon-enum       an anonymous `enum { ... }` used as a list of constants
   header-toggle   an #ifdef/#ifndef/#if defined() in a header around declarations, on a macro that is not the
-                  include guard and not already used in an #if anywhere in the base tree
+                  include guard and not already used in an #if anywhere in the base tree. A MODULE-LEVEL GUARD is
+                  allowed (the Chief's precedent on pr431, 2026-10-12): a _LH_<NAME>_LIB_ macro that configure.py at
+                  the base passes with /D to a Lionhead library's objects (e.g. _LH_3D_LIB_, _LH_MULTIPLAYER_LIB_),
+                  which hides a library's statics from the game's TUs the way the originals did. Defining or
+                  undefining such a guard in a source file is a hard header-toggle (only the build defines it).
   field-name      a new use of a `field_0x..` member in .c/.cpp code
   helper-in-cpp   a new function definition in a .c/.cpp that is not a real symbol (no matching name in
                   config/BW1W*/symbols.txt), i.e. a helper inline that belongs in a shared header
@@ -60,7 +64,9 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 HINTS = {
     "anon-enum": "bwr: \"Not really an enum, use a list of `#define` instead\". Turn each enumerator into a "
                  "`#define NAME value` (or give the enum a real type name if it is one).",
-    "header-toggle": "bwr: \"This is part of an LLM hacky solution. Avoid this.\" Declare it unconditionally in the "
+    "header-toggle": "bwr: \"This is part of an LLM hacky solution. Avoid this.\" If the original TUs must not see it, "
+                     "use the library's module-level guard (#ifdef _LH_3D_LIB_ etc., defined by configure.py), "
+                     "never a new per-header macro. Otherwise declare it unconditionally in the "
                      "header (AGENTS.md: globals are static members declared in the owning class's header).",
     "field-name": "bwr: \"If you use fields, you should name them\". Give the member a readable PascalCase name "
                   "in the header before using it (AGENTS.md, Naming: Member variables).",
@@ -230,6 +236,11 @@ class Source:
             if any(ASM_RE.search(c) for c in strip_code(body.splitlines())):
                 out.add(path)
         return out
+
+    def module_macros(self) -> set:
+        """The module-level guards: _LH_<NAME>_LIB_ macros configure.py passes with /D at the base."""
+        text = self.git("show", f"{self.base}:configure.py", check=False)
+        return set(re.findall(r"""["'][/-]D\s*(_LH_[A-Z0-9_]+_LIB_)\b""", text))
 
     def base_pragmas(self) -> set:
         """Normalised #pragma optimize/inline_depth/auto_inline lines already in the base tree."""
@@ -432,7 +443,8 @@ def function_name(sig: str) -> str:
 
 # ------------------------------------------------------------------------------------------------- checks
 
-def check_file(path, text, added, symbols, macros, pragmas=frozenset(), asm_files=frozenset()):
+def check_file(path, text, added, symbols, macros, pragmas=frozenset(), asm_files=frozenset(),
+               module_macros=frozenset()):
     findings = []
     lines = text.splitlines()
     code = strip_code(lines)
@@ -491,9 +503,16 @@ def check_file(path, text, added, symbols, macros, pragmas=frozenset(), asm_file
             if not m:
                 continue
             names = set(re.findall(r"[A-Za-z_]\w*", m.group(2))) - {"defined"}
-            new = sorted(n for n in names if n != guard and n not in macros and n not in KNOWN_MACROS)
+            new = sorted(n for n in names if n != guard and n not in macros and n not in KNOWN_MACROS and
+                         n not in module_macros)
             if new:
                 add("header-toggle", i, "new macro " + ", ".join(new))
+
+    # a module-level guard is the build's to define, never a source file's (that would be a per-file toggle)
+    for i, c in enumerate(code, 1):
+        m = re.match(r"\s*#\s*(define|undef)\s+(\w+)", c)
+        if i in added and m and m.group(2) in module_macros:
+            add("header-toggle", i, f"#{m.group(1)} of the module guard {m.group(2)}: only configure.py defines it")
 
     # field-name
     if is_code:
@@ -718,6 +737,7 @@ def run(repo: str, base: str, head: str = "", staged: bool = False, paths=(), al
         return findings
     symbols = src.symbols() if any(p.endswith(CODE) for p in added) else (set(), set())
     macros = src.base_macros() if any(p.endswith(HEADERS) for p in added) else set()
+    module_macros = src.module_macros()
     pragmas = src.base_pragmas()
     asm_files = None
     for path, rows in sorted(added.items()):
@@ -725,7 +745,8 @@ def run(repo: str, base: str, head: str = "", staged: bool = False, paths=(), al
             text = src.show(path)
             if asm_files is None and any(ASM_RE.search(c) for c in strip_code(text.splitlines())):
                 asm_files = src.asm_files()  # only looked up when a changed file has asm at all
-            findings += check_file(path, text, rows, symbols, macros, pragmas, asm_files or frozenset())
+            findings += check_file(path, text, rows, symbols, macros, pragmas, asm_files or frozenset(),
+                                   module_macros)
     return findings
 
 
