@@ -122,7 +122,7 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 STAGES = ("workup", "plan_review", "treatment", "code_review", "discharge")
-CLOSED = ("discharged", "escalated")
+CLOSED = ("discharged", "escalated", "closed")  # closed: the Chief retired the case (`close`), e.g. superseded
 PLAN_SECTIONS = ("Diagnosis", "Files", "Approach", "Risks", "Verification", "Open questions", "Size estimate")
 REVIEW_SECTIONS = ("Checks", "Blocking findings", "Resolution of prior findings", "Plan conformance",
                    "Match verification", "bwr checklist", "Anti-cheat checklist")
@@ -1228,6 +1228,23 @@ class Hospital:
         self.save(c)
         return f"{cid}: resolved, now in {stage}"
 
+    def close(self, cid: str, note: str) -> str:
+        """The Chief retires a case (e.g. superseded by a new one): it is never advanced or launched again. A worker
+        still running for it is not stopped here; check `status` first."""
+        self.need_root("close")
+        if not note.strip():
+            raise HospitalError("close needs a --note saying why (e.g. 'superseded by pr431m2')")
+        c = self.load(cid)
+        if c["stage"] == "discharged":
+            raise HospitalError(f"{cid} is discharged; nothing to close")
+        for e in c["escalations"]:
+            if e.get("open"):
+                e["open"], e["resolved"], e["note"] = False, now(), note
+        c["closed_from"], c["stage"], c["running"], c["rerun"] = c["stage"], "closed", None, 0
+        self.event(c, f"Chief closed the case: {note.strip()}")
+        self.save(c)
+        return f"{cid}: closed"
+
     def hold(self, cid: str, on: bool = True) -> str:
         if not on:
             self.need_root("releasing a hold")
@@ -1352,6 +1369,9 @@ def main(argv=None) -> int:
     rs.add_argument("--stage", required=True, choices=STAGES)
     rs.add_argument("--note", default="")
     rs.add_argument("--reset-rounds", action="store_true")
+    cl = sub.add_parser("close")
+    cl.add_argument("id")
+    cl.add_argument("--note", required=True)
     h = sub.add_parser("hold")
     h.add_argument("id")
     h.add_argument("--off", action="store_true")
@@ -1403,6 +1423,8 @@ def main(argv=None) -> int:
             print(hosp.allow_paths(a.id, a.head, a.paths))
         elif a.cmd == "resolve":
             print(hosp.resolve(a.id, a.stage, a.note, a.reset_rounds))
+        elif a.cmd == "close":
+            print(hosp.close(a.id, a.note))
         elif a.cmd == "hold":
             print(hosp.hold(a.id, not a.off))
     except HospitalError as e:

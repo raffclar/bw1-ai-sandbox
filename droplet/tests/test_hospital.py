@@ -523,6 +523,22 @@ class HospitalTests(unittest.TestCase):
         self.hosp.release("pr431", head)
         self.assertEqual(self.hosp.chief("pr431")["release"], [head])
 
+    def test_close_retires_a_case_for_good(self):
+        self.triage()
+        self.hosp.advance("pr431")  # launches the workup
+        with self.assertRaises(H.HospitalError):
+            self.hosp.close("pr431", "superseded")  # root only
+        self.hosp._root = True
+        with self.assertRaises(H.HospitalError):
+            self.hosp.close("pr431", " ")  # a reason is required
+        self.assertEqual(self.hosp.close("pr431", "superseded by pr431m2"), "pr431: closed")
+        self.hosp._root = False
+        c = self.hosp.load("pr431")
+        self.assertEqual((c["stage"], c["running"], c["closed_from"]), ("closed", None, "workup"))
+        calls = len(self.ward.calls)
+        self.assertEqual(self.hosp.advance("pr431"), "pr431: closed")
+        self.assertEqual(len(self.ward.calls), calls)  # nothing launched again
+
     def test_review_parsing(self):
         head = "a" * 40
         r = H.parse_review(review("REQUEST_CHANGES", head, ["B3", "B4"], ["B1"]))
