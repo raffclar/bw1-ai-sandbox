@@ -5,6 +5,7 @@ workers "run" synchronously, doing whatever the test scripted, and never touch a
   python3 droplet/tests/test_hospital.py -v
 """
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -930,6 +931,58 @@ class HospitalTests(unittest.TestCase):
         for want in ("/work/base-report.json", "/work/start-report.json", "/work/head-report.json",
                      "--fail-on-regression"):
             self.assertIn(want, sh)
+
+
+class VerifyScriptTests(unittest.TestCase):
+    """hospital/verify.sh itself, run against stub trees: the setup is a fake configure.py that, like the project's,
+    refuses a dtk split (build/<VERSION>/config.json) listing a unit its tree lacks; ninja is a stub that splits."""
+
+    NINJA = """#!/usr/bin/env python3
+import json, os, pathlib
+b = pathlib.Path("build", os.environ["VERSION"])
+b.mkdir(parents=True, exist_ok=True)
+units = pathlib.Path("splits.txt").read_text().split()
+for name in ("config.json", "baseline.json", "report.json"):
+    (b / name).write_text(json.dumps({"units": units}))
+"""
+    CONFIGURE = """import json, os, pathlib, sys
+own = set(pathlib.Path("splits.txt").read_text().split())
+p = pathlib.Path("build", os.environ["VERSION"], "config.json")
+missing = sorted(set(json.loads(p.read_text())["units"]) - own) if p.is_file() else []
+sys.exit("Missing configuration: " + " ".join(missing) if missing else 0)
+"""
+
+    def tree(self, path, units):
+        (path / "tools").mkdir(parents=True)
+        (path / "splits.txt").write_text("".join(u + "\n" for u in units))
+        (path / "configure.py").write_text(self.CONFIGURE)
+        (path / "tools/decomp-regress.py").write_text("")
+
+    @unittest.skipUnless(shutil.which("sh") and shutil.which("python3"), "needs sh and python3")
+    def test_a_start_with_fewer_units_than_the_base_builds_with_its_own_split(self):
+        # pr431m2: the merge case's start predates the base, whose splits add GestureSystemMatch; the base's split
+        # was left in build/ and the start's configure.py refused it, so the start was never measured
+        work = Path(tempfile.mkdtemp(prefix="verifysh-"))
+        self.addCleanup(shutil.rmtree, work, True)
+        self.tree(work / "tree", ["Black/A.cpp", "Black/GestureSystemMatch.cpp"])
+        self.tree(work / "start", ["Black/A.cpp"])
+        self.tree(work / "head", ["Black/A.cpp", "Black/GestureSystemMatch.cpp"])
+        stubs = work / "bin"
+        stubs.mkdir()
+        (stubs / "ninja").write_text(self.NINJA)
+        (stubs / "ninja").chmod(0o755)
+        (work / "gitconfig").write_text("[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n")
+        env = {**os.environ, "DISCHARGE_WORK": str(work), "VERSION": "BW1W120",
+               "WORKER_SETUP": json.dumps(["python3", "configure.py"]),
+               "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}", "GIT_CONFIG_GLOBAL": str(work / "gitconfig")}
+        r = subprocess.run(["sh", str(DROPLET / "hospital/verify.sh")], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Missing configuration", r.stdout + r.stderr)
+        self.assertEqual(json.loads((work / "verify.json").read_text()),
+                         {"baseline": 0, "start": 0, "head_build": 0, "regress": 0})
+        self.assertEqual(json.loads((work / "start-report.json").read_text())["units"], ["Black/A.cpp"])
+        self.assertEqual(json.loads((work / "head-report.json").read_text())["units"],
+                         ["Black/A.cpp", "Black/GestureSystemMatch.cpp"])
 
 
 class AttendingIsolationTests(unittest.TestCase):

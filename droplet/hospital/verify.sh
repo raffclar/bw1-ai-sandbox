@@ -16,10 +16,11 @@
 # (-> /work/head-report.json). Writes /work/verify.json; exit 0 only when the base and head steps passed (a start
 # that fails to build is recorded as "start": 1 and leaves no start report; the host then can't measure progress).
 set -u
-cd /work/tree || exit 2
+WORK=${DISCHARGE_WORK:-/work}  # tests point this at a scratch directory
+cd "$WORK/tree" || exit 2
 START=2  # 2 = not measured in this run
 result() {
-	printf '{"baseline": %s, "start": %s, "head_build": %s, "regress": %s}\n' "$1" "$START" "$2" "$3" >/work/verify.json
+	printf '{"baseline": %s, "start": %s, "head_build": %s, "regress": %s}\n' "$1" "$START" "$2" "$3" >"$WORK/verify.json"
 }
 setup() {
 	python3 -c 'import json, os, subprocess, sys; sys.exit(subprocess.run(json.loads(os.environ["WORKER_SETUP"])).returncode)'
@@ -32,6 +33,9 @@ swap_to() {
 	find . -mindepth 1 -maxdepth 1 ! -name .git ! -name build ! -name orig -exec rm -rf {} +
 	cp -a "$1/." . || return 1
 	find build -path '*/src/*' -name '*.o' -delete
+	# dtk's split output describes the previous tree's splits.txt; configure.py would check the new tree's units
+	# against it ("Missing configuration" for a unit the new tree lacks), so each tree's setup splits afresh
+	rm -f "build/$VERSION/config.json"
 	commit "$2"
 }
 REPORT="build/$VERSION/report.json"
@@ -41,22 +45,22 @@ git init -q . && commit base || { result 1 1 1; exit 1; }
 if ! setup; then echo "setup failed at the base"; result 1 1 1; exit 1; fi
 echo "== base: ninja baseline"
 if ! ninja baseline; then echo "ninja baseline failed at the base"; result 1 1 1; exit 1; fi
-cp "build/$VERSION/baseline.json" /work/base-report.json
+cp "build/$VERSION/baseline.json" "$WORK/base-report.json"
 
-if [ -d /work/start ]; then
+if [ -d "$WORK/start" ]; then
 	echo "== start: swap trees"
 	START=1
-	if swap_to /work/start start && echo "== start: setup" && setup && echo "== start: ninja all_source" &&
+	if swap_to "$WORK/start" start && echo "== start: setup" && setup && echo "== start: ninja all_source" &&
 		ninja all_source && echo "== start: decomp-regress.py --refresh" &&
 		python3 tools/decomp-regress.py --refresh >/dev/null; then
-		cp "$REPORT" /work/start-report.json && START=0
+		cp "$REPORT" "$WORK/start-report.json" && START=0
 	else
 		echo "the start tree did not build; its progress can't be measured"
 	fi
 fi
 
 echo "== head: swap trees"
-swap_to /work/head head || { result 0 1 1; exit 1; }
+swap_to "$WORK/head" head || { result 0 1 1; exit 1; }
 echo "== head: setup"
 if ! setup; then echo "setup failed at the head"; result 0 1 1; exit 1; fi
 echo "== head: ninja all_source"
@@ -64,6 +68,6 @@ if ! ninja all_source; then echo "ninja all_source failed at the head"; result 0
 echo "== head: decomp-regress.py --refresh --fail-on-regression"
 python3 tools/decomp-regress.py --refresh --fail-on-regression
 status=$?
-cp "$REPORT" /work/head-report.json
+cp "$REPORT" "$WORK/head-report.json"
 result 0 0 "$status"
 exit "$status"
