@@ -26,7 +26,11 @@ Commands:
             runs of the head) on the open harness PRs of both targets since the last check, and store them.
             With FEEDBACK_TO_SANDBOX=true, new comments from FEEDBACK_AUTHORS are queued as follow-up
             prompts for the worker that made the PR (off by default).
-  reply     post a conversation comment (or a comment-only review with --review) on ONE harness PR.
+  reply     post a conversation comment (or a comment-only review with --review) on ONE harness PR. Anti-spam
+            (bwrsandman, #452: "Why are you spamming already merged PR's?"; #411/#468: "Needs rebase"): only on an
+            OPEN PR, never twice the same text, never again before someone else has answered our last post, at most
+            MAX_REPLIES_PER_DAY a day, and a request for (re-)review only when the PR is rebased (GitHub's
+            mergeStateStatus is not BEHIND or DIRTY and it is not CONFLICTING).
 
 Guards, layered:
   * git pushes go only to the `fork` remote, and only if its push URL is FORK_REPO (never openblack);
@@ -35,7 +39,9 @@ Guards, layered:
     pr create (harness head, draft) / pr list / pr view / pr comment and pr review --comment on harness
     PRs / GET of a few read endpoints. Editing or deleting comments, closing, merging, labelling, any
     other gh command or HTTP method, and any write to a non-harness PR are refused;
-  * a harness PR is one whose head branch starts with BRANCH_PREFIX in FORK_REPO's owner.
+  * a harness PR is one whose head branch starts with BRANCH_PREFIX in FORK_REPO's owner;
+  * comments and reviews only on OPEN harness PRs: never on a merged or closed one (the guard asks GitHub);
+  * a branch whose change conflicts with upstream main is not published ("Needs rebase"): rejected for that head.
 
 Usage:
   publisher.py [--config /etc/bw1-sandbox/publisher.env] [--dry-run] [publish|comments]
@@ -97,7 +103,12 @@ DEFAULTS = {
     "CASES_DIR": "/var/lib/bw1-sandbox/cases",
     "INTEGRITY": "/etc/bw1-sandbox/integrity.json",
     "QUALITY_GATE": "true",
+    # Anti-spam for `reply` (bwrsandman, #452): posts per day over all PRs
+    "MAX_REPLIES_PER_DAY": "3",
 }
+# A post asking for (re-)review or saying the feedback is addressed: only on a PR that is rebased on main
+REREVIEW_RE = re.compile(r"re-?review|ready for (?:another |a )?(?:look|review)|\bPTAL\b|please (?:take a )?look|"
+                         r"addressed (?:the|your|all)|feedback (?:is )?addressed|when you have a moment", re.I)
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
@@ -163,8 +174,9 @@ class GhGuard:
                 return a.split("=", 1)[1]
         return None
 
-    def check(self, args, is_harness_pr=None) -> str:
-        """Return "fork" or "openblack" (which token to use), or raise Refused."""
+    def check(self, args, is_harness_pr=None, is_open_pr=None) -> str:
+        """Return "fork" or "openblack" (which token to use), or raise Refused. Comments and reviews also need
+        is_open_pr(repo, number) to say the PR is open (not merged or closed)."""
         if len(args) < 2:
             raise Refused(f"gh {' '.join(args)}: not allowed")
         if args[0] == "api":
@@ -199,6 +211,9 @@ class GhGuard:
                 raise Refused(f"gh pr {sub}: needs an explicit PR number")
             if is_harness_pr is None or not is_harness_pr(repo, int(number)):
                 raise Refused(f"gh pr {sub} on {repo}#{number}: not a harness PR")
+            if is_open_pr is None or not is_open_pr(repo, int(number)):
+                raise Refused(f"gh pr {sub} on {repo}#{number}: the PR is not open (merged or closed); never comment "
+                              "on a merged or closed PR")
             return kind
         raise Refused(f"gh pr {sub}: not allowed (edit, close, merge, ready, reopen, checkout, ... are refused)")
 
@@ -257,16 +272,31 @@ class Publisher:
     def target_repo(self, target: str) -> str:
         return self.cfg["UPSTREAM_REPO"] if target == "openblack" else self.cfg["FORK_REPO"]
 
-    def is_harness_pr(self, repo: str, number: int) -> bool:
+    def pr_info(self, repo: str, number: int) -> dict:
+        """The PR's head, state and mergeability (one `pr view` per PR and run; itself an allowed read)."""
         key = (repo.lower(), number)
         if key not in self._harness_cache:
-            # Reading the PR's head is itself an allowed read (pr view).
-            data = json.loads(self._gh_exec(["pr", "view", str(number), "--repo", repo, "--json",
-                                             "headRefName,headRepositoryOwner"], self._kind(repo)) or "{}")
-            owner = ((data.get("headRepositoryOwner") or {}).get("login") or "").lower()
-            self._harness_cache[key] = (owner == self.guard.fork_owner
-                                        and (data.get("headRefName") or "").startswith(self.cfg["BRANCH_PREFIX"]))
+            self._harness_cache[key] = json.loads(self._gh_exec(
+                ["pr", "view", str(number), "--repo", repo, "--json",
+                 "headRefName,headRepositoryOwner,state,mergeable,mergeStateStatus"], self._kind(repo)) or "{}")
         return self._harness_cache[key]
+
+    def is_harness_pr(self, repo: str, number: int) -> bool:
+        data = self.pr_info(repo, number)
+        owner = ((data.get("headRepositoryOwner") or {}).get("login") or "").lower()
+        return owner == self.guard.fork_owner and (data.get("headRefName") or "").startswith(self.cfg["BRANCH_PREFIX"])
+
+    def is_open_pr(self, repo: str, number: int) -> bool:
+        return (self.pr_info(repo, number).get("state") or "").upper() == "OPEN"
+
+    def needs_rebase(self, repo: str, number: int) -> str:
+        """Why the PR must be rebased on main first ("" when it need not)."""
+        data = self.pr_info(repo, number)
+        if (data.get("mergeable") or "").upper() == "CONFLICTING":
+            return "it conflicts with main"
+        if (data.get("mergeStateStatus") or "").upper() in ("BEHIND", "DIRTY"):
+            return f"GitHub says it is {data['mergeStateStatus'].upper()}"
+        return ""
 
     def _kind(self, repo: str) -> str:
         return "openblack" if repo.lower() == self.guard.upstream else "fork"
@@ -284,7 +314,7 @@ class Publisher:
     def gh(self, args, write: bool = False) -> str:
         """Every gh call goes through here: guard first, then the matching token. In a dry run, writes
         are printed and reads still run when their token is available."""
-        kind = self.guard.check(args, self.is_harness_pr)
+        kind = self.guard.check(args, self.is_harness_pr, self.is_open_pr)
         if self.dry and write:
             self.log(f"would run: gh {' '.join(args)}   [token: {kind}]")
             return ""
@@ -430,6 +460,12 @@ class Publisher:
                     "head": head, "why": f"quality gate: {len(hard)} hard failure(s){esc}: {listed[:10]}"}
                 return False
             self.current["warnings"] = [f for f in findings if f.level == "warn"]
+        conflicts = self.main_conflicts(head)
+        if conflicts:
+            self.log(f"REFUSED {name}: needs rebase, conflicts with upstream main in {conflicts[:10]}")
+            state.setdefault("rejected", {})[name] = {"head": head, "why": f"needs rebase (conflicts with upstream "
+                                                                           f"main): {conflicts[:10]}"}
+            return False
         if not data:
             # One commit on upstream main, by the configured author, rather than the worker's own commits
             commit = self.part_commit(base, head, files, name, "code", commits)
@@ -456,6 +492,16 @@ class Publisher:
         if not self.dry:
             state.setdefault("published", {})[name] = {"head": head, "parts": published}
         return True
+
+    def main_conflicts(self, head: str) -> list:
+        """Paths where head does not merge cleanly with upstream main (bwrsandman: "Needs rebase")."""
+        p = subprocess.run(["git", "-C", self.cfg["PUBLISH_CLONE"], "merge-tree", "--write-tree", "--name-only",
+                            "--no-messages", "refs/remotes/origin/main", head], capture_output=True, text=True)
+        if p.returncode == 0:
+            return []
+        if p.returncode != 1:
+            raise RuntimeError(f"git merge-tree failed: {p.stderr.strip()[-600:]}")
+        return [f for f in p.stdout.splitlines()[1:] if f.strip()] or ["(unknown)"]
 
     # --- hospital ---------------------------------------------------------------------------
 
@@ -835,11 +881,71 @@ class Publisher:
         repo = self.target_repo(target)
         if not Path(body_file).is_file():
             raise SystemExit(f"no body file {body_file}")
+        text = Path(body_file).read_text(encoding="utf-8")
+        self.spam_check(repo, number, text)
         args = (["pr", "review", str(number), "--repo", repo, "--comment", "--body-file", body_file] if review
                 else ["pr", "comment", str(number), "--repo", repo, "--body-file", body_file])
         out = self.gh(args, write=True)
         self.log(f"posted {'review' if review else 'comment'} on {repo}#{number} {out}")
+        if not self.dry:
+            state = self.load_state()
+            state.setdefault("replies", {}).setdefault(f"{repo}#{number}", []).append(
+                {"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "sha256": body_hash(text)})
+            state.setdefault("days", {}).setdefault(self.today, {}).setdefault("replies", 0)
+            state["days"][self.today]["replies"] += 1
+            self.save_state(state)
         return 0
+
+    def spam_check(self, repo: str, number: int, text: str) -> None:
+        """Refuse a post that would look like spam (bwrsandman, #452: "Why are you spamming already merged PR's?")."""
+        if not self.is_harness_pr(repo, number):
+            raise Refused(f"{repo}#{number}: not a harness PR")
+        if not self.is_open_pr(repo, number):
+            raise Refused(f"{repo}#{number} is {self.pr_info(repo, number).get('state') or 'not open'}: never comment "
+                          "on a merged or closed PR")
+        state = self.load_state()
+        mine = state.get("replies", {}).get(f"{repo}#{number}", [])
+        if any(r.get("sha256") == body_hash(text) for r in mine):
+            raise Refused(f"{repo}#{number}: this exact text was already posted")
+        today = state.get("days", {}).get(self.today, {}).get("replies", 0)
+        if today >= int(self.cfg["MAX_REPLIES_PER_DAY"]):
+            raise Refused(f"reply limit reached ({today}/{self.cfg['MAX_REPLIES_PER_DAY']} today)")
+        if mine:
+            last = max(r["at"] for r in mine)
+            others = self.others_since(repo, number, last)
+            if not others:
+                raise Refused(f"{repo}#{number}: nobody has answered our last post ({last}); no follow-up pings")
+        if REREVIEW_RE.search(text):
+            why = self.needs_rebase(repo, number)
+            if why:
+                raise Refused(f"{repo}#{number}: rebase it on main before asking for review ({why})")
+
+    def others_since(self, repo: str, number: int, since: str) -> int:
+        """How many comments or reviews by someone other than us are newer than `since`."""
+        n = 0
+        for ep in (f"repos/{repo}/issues/{number}/comments", f"repos/{repo}/pulls/{number}/reviews",
+                   f"repos/{repo}/pulls/{number}/comments"):
+            out = self.gh(["api", ep, "--paginate"])
+            for c in (json.loads(out) if out else []):
+                who = ((c.get("user") or {}).get("login") or "").lower()
+                at = when(c.get("submitted_at") or c.get("created_at"))
+                if who and who != self.guard.fork_owner and at > when(since):
+                    n += 1
+        return n
+
+
+def when(stamp) -> dt.datetime:
+    """A GitHub or our own ISO timestamp as an aware datetime (the epoch when missing or malformed)."""
+    try:
+        t = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return dt.datetime.fromtimestamp(0, dt.timezone.utc)
+
+
+def body_hash(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
 
 
 def main(argv=None) -> int:

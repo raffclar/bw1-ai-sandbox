@@ -11,7 +11,7 @@ Roles
                     gets the case, the plan and the head sha in its prompt, fetches the Fellow's commits with
                     `git fetch /peers/<fellow>/repo agent/<fellow>` and writes ~/case/review.md from the fixed review
                     template (verdict, checks, [B#] blocking findings, resolution of prior findings, plan
-                    conformance, match verification with a revert check, bwrsandman's 13-rule checklist and the
+                    conformance, match verification with a revert check, bwrsandman's checklist (bwr-checklist.md) and the
                     anti-cheat checklist).
                     Isolation: upstream bw1-ai-sandbox mounts ALL worker folders at /peers. sandbox_droplet.py patches
                     the launch so a worker named att-<case>-<n> gets only /peers/<fellow>/repo (read-only): never the

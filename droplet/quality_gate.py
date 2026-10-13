@@ -14,7 +14,8 @@ Hard failures (a commit, a review and the publisher refuse them):
                   include guard and not already used in an #if anywhere in the base tree. A MODULE-LEVEL GUARD is
                   allowed (the Chief's precedent on pr431, 2026-10-12): a _LH_<NAME>_LIB_ macro that configure.py at
                   the base passes with /D to a Lionhead library's objects (e.g. _LH_3D_LIB_, _LH_MULTIPLAYER_LIB_),
-                  which hides a library's statics from the game's TUs the way the originals did. Defining or
+                  (static data under one is the hard guarded-static since bwr's #431 review, 2026-10-12; other
+                  code under one is the module-guard warning). Defining or
                   undefining such a guard in a source file is a hard header-toggle (only the build defines it).
   field-name      a new use of a `field_0x..` member in .c/.cpp code
   helper-in-cpp   a new function definition in a .c/.cpp that is not a real symbol (no matching name in
@@ -22,6 +23,20 @@ Hard failures (a commit, a review and the publisher refuse them):
   clamp           a hand-written clamp/min/max (ternary, if-assign, if/else-assign, if-return) where CLAMP from
                   re_common.h or windef.h's min/max fit
   mid-file        an #include, global definition or declaration after the first function body of a .c/.cpp
+  array-size      `sizeof(a) / sizeof(a[0])` (or `sizeof(*a)`) where re_common.h's ARRAY_SIZE fits (bwr, #431)
+  dup-helper      a new function or #define that re-implements an existing macro: a min/max/clamp/bound/saturate
+                  helper (CLAMP, windef.h min/max) or an array-count helper (ARRAY_SIZE), by name or by a body that
+                  is one min/max select (bwr on #431's boundf: "We have a macro for this already")
+  guarded-static  a static data member or static variable declared in a header inside an #if on a library's
+                  module guard (_LH_3D_LIB_ ...): bwr on #431: "This pattern is Claude getting confused and trying
+                  to get a match even if the code is implausible. Likely that this Static lives in the cpp file".
+                  It SUPERSEDES the Chief's 2026-10-12 module-guard precedent for statics.
+  own-header      a NEW header whose only code is one or more inline definitions of members of a class declared
+                  elsewhere (bwr on #431's CameraInline.h: "This doesn't need its own header")
+  string-define   a string literal added in code although a `#define NAME "..."` of the same literal exists in
+                  the tree (bwr on #431: "a very commonly used string can you put it in a define?")
+  deviation       a BUGFIX / FIX_BUGS marker or a "fix an original bug" change: the decomp reproduces the original
+                  code; bugs go in a GitHub issue (bwr on #411: "It's too early to deviate from original code")
 Anti-cheat (hard; a match must come from plain C++ that the original compiler turns into the original bytes):
   inline-asm      __asm / _asm / asm( blocks in a file that had no inline asm at the asm base (--asm-base, default
                   --base: the case's upstream merge-base), and __declspec(naked) functions anywhere
@@ -45,6 +60,12 @@ Warnings (reported, never failing):
   pragma-opt      a #pragma optimize/inline_depth/auto_inline line that is not already in the base tree
   magic-float     a non-trivial float literal in a function body
   matrix-math     element-by-element matrix or vector maths that the inline helpers already provide
+  repeated-string a string literal added in code that already appears in 3 or more places in the tree: put it in
+                  a #define (bwr on #431)
+  constants-header a NEW header holding only constants and included from at most one file (bwr on #412's
+                  GestureConstants.h: "How many places is this included from?"): put them at the top of that file
+  module-guard    any other new #if on a module guard in a header: allowed by the gate, a reviewer checks it has
+                  evidence (statics under one are the hard guarded-static)
 
 It reads git objects only. Nothing from the change is built or run.
 """
@@ -65,9 +86,10 @@ HINTS = {
     "anon-enum": "bwr: \"Not really an enum, use a list of `#define` instead\". Turn each enumerator into a "
                  "`#define NAME value` (or give the enum a real type name if it is one).",
     "header-toggle": "bwr: \"This is part of an LLM hacky solution. Avoid this.\" If the original TUs must not see it, "
-                     "use the library's module-level guard (#ifdef _LH_3D_LIB_ etc., defined by configure.py), "
-                     "never a new per-header macro. Otherwise declare it unconditionally in the "
-                     "header (AGENTS.md: globals are static members declared in the owning class's header).",
+                     "it probably lives in its own .cpp (bwr on #431: \"Likely that this Static lives in the cpp "
+                     "file\"); never a new per-header macro, and never statics under a module guard (guarded-static). "
+                     "Otherwise declare it unconditionally in the header (AGENTS.md: globals are static members "
+                     "declared in the owning class's header).",
     "field-name": "bwr: \"If you use fields, you should name them\". Give the member a readable PascalCase name "
                   "in the header before using it (AGENTS.md, Naming: Member variables).",
     "helper-in-cpp": "bwr: \"any utility inline should probably live in a header that's accessible to everyone\". "
@@ -97,9 +119,36 @@ HINTS = {
     "magic-float": "bwr: \"I would declare these magic values at the top of the file using `#define`\".",
     "matrix-math": "bwr: \"Likely this is from an inline matrix function already defined\". Check LHMatrix.h / "
                    "LHPoint.h / LH3DMath.h (SetRotationY, RotateY, SetTranslateOnly, GetNorme, ...) first.",
+    "array-size": "bwr (#431): \"We have an ARRAY_SIZE macro to do this\". Use ARRAY_SIZE(a) from re_common.h "
+                  "(#include <re_common.h> /* For ARRAY_SIZE */).",
+    "dup-helper": "bwr (#431, boundf): \"We have a macro for this already\". Use the existing macro (CLAMP or "
+                  "ARRAY_SIZE from re_common.h, windef.h's min/max) instead of a new helper; search include/ and "
+                  "src/ for an existing macro before writing one. A real symbol (in config/BW1W*/symbols.txt) is "
+                  "exempt.",
+    "guarded-static": "bwr (#431): \"This pattern is Claude getting confused and trying to get a match even if the "
+                      "code is implausible. Likely that this Static lives in the cpp file\". Define the static in "
+                      "the library's .cpp that owns it (file scope or a class static defined there), not in a header "
+                      "under #ifdef _LH_..._LIB_; accept the match loss and leave a TODO rather than an implausible "
+                      "layout.",
+    "own-header": "bwr (#431, CameraInline.h): \"This doesn't need its own header\". Put the inline in the "
+                  "owning class's header (or the header the original evidently had it in) instead of a new one.",
+    "string-define": "bwr (#431): \"This is a very commonly used string can you put it in a define?\" Use the "
+                     "existing #define named in the detail.",
+    "repeated-string": "bwr (#431): \"This is a very commonly used string can you put it in a define?\" Give the "
+                       "literal a #define in the header that owns it and use it everywhere.",
+    "deviation": "bwr (#411): \"It's too early to deviate from original code. If we do this in the future it will "
+                 "be on a different branch\". Reproduce the original's behaviour (bugs included; a plain comment "
+                 "may describe the bug) and report the bug as a GitHub issue (\"make two issues for the bugs you "
+                 "find\"), never fix it in the decomp.",
+    "constants-header": "bwr (#412, GestureConstants.h): \"How many places is this included from?\" A header "
+                        "for constants used in one file is noise: put them as #defines at the top of that file, "
+                        "or in the owning class's header if several files need them.",
+    "module-guard": "Allowed by the gate (precedent 2026-10-12), but bwr distrusts module-guard blocks in headers "
+                    "(#431). A reviewer checks the evidence; never use one for statics (guarded-static).",
 }
 HARD = {"anon-enum", "header-toggle", "field-name", "helper-in-cpp", "clamp", "mid-file", "inline-asm", "emit",
-        "pragma-section", "byte-code", "tamper-path"}
+        "pragma-section", "byte-code", "tamper-path", "array-size", "dup-helper", "guarded-static", "own-header",
+        "string-define", "deviation"}
 ESCALATE = {"tamper-path"}
 # Paths a worker never changes (fnmatch, where `*` also matches `/`)
 TAMPER_PATHS = ("objdiff.json", "build.ninja", "configure.py", "config/*", "tools/*", "build/*", "*.o", "*.obj",
@@ -123,6 +172,16 @@ KNOWN_MACROS = {"__cplusplus", "_MSC_VER", "_WIN32", "WIN32", "NDEBUG", "_DEBUG"
                 "VERSION_BW1W100", "VERSION_BW1W110", "VERSION_BW1W120", "VERSION_BW1M119"}
 TRIVIAL_FLOATS = {0.0, 1.0, -1.0, 2.0, 0.5, -0.5, 0.25, 10.0, 100.0, 1000.0, 255.0, 256.0, 3.0, 4.0}
 KEYWORDS = {"if", "for", "while", "switch", "return", "else", "do", "case", "sizeof", "catch", "new", "delete"}
+ARRAY_SIZE_RE = re.compile(r"\bsizeof\s*\(?\s*([A-Za-z_][\w.\->:]*)\s*\)?\s*/\s*sizeof\s*\(?\s*"
+                           r"(?:\(?\s*\1\s*\)?\s*\[\s*0\s*\]|\*\s*\(?\s*\1\s*\)?)\s*\)?")
+# Names of helpers that re-implement re_common.h's CLAMP / ARRAY_SIZE or windef.h's min/max
+DUP_HELPER_RE = re.compile(r"^(?:(?:bound|clamp|saturate)(?:f|i|d|_?float|_?int|_?value|_?range)?|"
+                           r"(?:min|max)(?:f|i|d|_?float|_?int|imum)?|"
+                           r"(?:array_?size|array_?count|array_?len|count_?of|num_?elements|elements_?of|n_?elems))$",
+                           re.I)
+DEVIATION_RE = re.compile(r"\bbug[ _-]?fix(?:es|ed)?\b|\bFIX_?BUGS?\b|\bfix(?:es|ed|ing)?\s+(?:an?\s+|the\s+)?"
+                          r"(?:original|vanilla)(?:[ -]game)?(?:'s)?\s+bugs?\b", re.I)
+MODULE_GUARD_RE = re.compile(r"\b_LH_[A-Z0-9_]+_LIB_\b")
 
 
 @dataclass
@@ -236,6 +295,25 @@ class Source:
             if any(ASM_RE.search(c) for c in strip_code(body.splitlines())):
                 out.add(path)
         return out
+
+    def tree_grep(self, *args) -> str:
+        """git grep over src/ and include/ at head (or in the index)."""
+        where = ["--cached"] if self.staged else []
+        rev = [] if self.staged else [self.head]
+        return self.git("grep", *where, *args, *rev, "--", "src", "include", check=False)
+
+    def includers(self, name: str) -> list:
+        """Paths that #include a header of this file name at head."""
+        out = self.tree_grep("-l", "-E", r"^[[:space:]]*#[[:space:]]*include[[:space:]]*[<\"]([^>\"]*/)?" + re.escape(name) + r"[>\"]")
+        return sorted({row.split(":", 1)[1] if not self.staged and row.startswith(self.head + ":") else row
+                       for row in out.splitlines() if row})
+
+    def literal_uses(self, lit: str):
+        """(lines holding the literal in src/ and include/ at head, the #define names whose value is exactly it)."""
+        rows = [r for r in self.tree_grep("-h", "-F", "-e", lit).splitlines() if r]
+        defines = [m.group(1) for m in (re.match(r"\s*#\s*define\s+(\w+)\s+" + re.escape(lit) + r"\s*(//.*|/\*.*)?$", r)
+                                        for r in rows) if m]
+        return len(rows), defines
 
     def module_macros(self) -> set:
         """The module-level guards: _LH_<NAME>_LIB_ macros configure.py passes with /D at the base."""
@@ -478,13 +556,59 @@ def check_file(path, text, added, symbols, macros, pragmas=frozenset(), asm_file
                 add("byte-code", i, "string literal" if target == '"' else f"byte array {target}")
                 break
 
-    # anon-enum
+    # anon-enum (bwr on #412 too: "I prefer a list of defines than an anonymous enum for named values"), on its own
+    # line, `enum {` or `enum { A = 1, B = 2 };` on one line
     for i, c in enumerate(code, 1):
         if re.search(r"(?<!typedef )\benum\s*(\{|$)", c.strip()) and not c.strip().startswith("typedef"):
             nxt = next((code[j].strip() for j in range(i, min(i + 3, len(code))) if code[j].strip()), "")
-            if c.strip().endswith("{") or nxt.startswith("{"):
+            if re.search(r"\benum\s*\{", c) or nxt.startswith("{"):
                 if i in added:
                     add("anon-enum", i)
+
+    # array-size, deviation
+    for i, c in enumerate(code, 1):
+        if i not in added:
+            continue
+        if ARRAY_SIZE_RE.search(c) and not re.match(r"\s*#\s*define\s+ARRAY_SIZE\b", c):
+            add("array-size", i)
+        if DEVIATION_RE.search(lines[i - 1]):
+            add("deviation", i)
+
+    # dup-helper: #defines and namespace-level functions named like an existing macro (real symbols exempt)
+    quals, frees = symbols
+    for i, c in enumerate(code, 1):
+        m = re.match(r"\s*#\s*define\s+(\w+)\s*\(", c)
+        if i in added and m and DUP_HELPER_RE.match(m.group(1)) and m.group(1) not in ("ARRAY_SIZE", "CLAMP"):
+            add("dup-helper", i, f"macro {m.group(1)}")
+    helpers, _ = scan_toplevel(code)
+    for f in helpers:
+        if f.start not in added or f.name in quals or f.name in frees:
+            continue
+        body = " ".join(code[f.body_open - 1:f.body_close]).split("{", 1)[-1].rsplit("}", 1)[0].strip()
+        one_select = bool(re.fullmatch(r"return\s+[^;]*\?[^;]*:[^;]*;", body)
+                          and re.search(r"\b(min|max|MIN|MAX)\s*\(", body))
+        if DUP_HELPER_RE.match(f.name.split("::")[-1]) or one_select:
+            add("dup-helper", f.start, f.name + (" is one min/max select" if one_select else ""))
+
+    # guarded-static / module-guard: what a header hides behind a library's module guard
+    if is_header:
+        stack = []  # one bool per open #if: does its condition name a module guard?
+        for i, c in enumerate(code, 1):
+            m = re.match(r"\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)", c)
+            if m:
+                kw = m.group(1)
+                if kw in ("ifdef", "ifndef", "if"):
+                    guarded = bool(MODULE_GUARD_RE.search(m.group(2)))
+                    stack.append(guarded)
+                    if guarded and i in added:
+                        add("module-guard", i)
+                elif kw == "endif" and stack:
+                    stack.pop()
+                continue
+            if i in added and any(stack) and re.search(r"\bstatic\b", c):
+                decl = re.sub(r"\[[^\]]*\]", "", c)
+                if "(" not in decl.split("=")[0]:
+                    add("guarded-static", i)
 
     # header-toggle
     if is_header:
@@ -523,7 +647,6 @@ def check_file(path, text, added, symbols, macros, pragmas=frozenset(), asm_file
     functions, statements = scan_toplevel(code)
 
     # helper-in-cpp
-    quals, frees = symbols
     if is_code:
         for f in functions:
             if f.start not in added or "template" in f.signature.split("(")[0]:
@@ -735,7 +858,7 @@ def run(repo: str, base: str, head: str = "", staged: bool = False, paths=(), al
     added = src.added()
     if not added:
         return findings
-    symbols = src.symbols() if any(p.endswith(CODE) for p in added) else (set(), set())
+    symbols = src.symbols()
     macros = src.base_macros() if any(p.endswith(HEADERS) for p in added) else set()
     module_macros = src.module_macros()
     pragmas = src.base_pragmas()
@@ -747,7 +870,60 @@ def run(repo: str, base: str, head: str = "", staged: bool = False, paths=(), al
                 asm_files = src.asm_files()  # only looked up when a changed file has asm at all
             findings += check_file(path, text, rows, symbols, macros, pragmas, asm_files or frozenset(),
                                    module_macros)
+            if path.endswith(HEADERS) and not src.blob(src.base, path):
+                findings += new_header_findings(src, path, text)
+    findings += string_findings(src, added)
     return findings
+
+
+def new_header_findings(src: "Source", path: str, text: str) -> list:
+    """own-header / constants-header for a header the change creates."""
+    lines = text.splitlines()
+    code = strip_code(lines)
+    pp = preproc_lines(code)
+    functions, statements = scan_toplevel(code)
+    body = "\n".join(c for i, c in enumerate(code, 1) if i not in pp)
+    has_type = re.search(r"\b(class|struct|union|enum)\s+\w*\s*(:[^;{]*)?\{", body)
+    if functions and not has_type and not statements and all("::" in f.name for f in functions):
+        first = functions[0].start
+        return [Finding("own-header", path, first, lines[first - 1],
+                        f"only defines {', '.join(f.name for f in functions[:4])}")]
+    defines = [i for i, c in enumerate(code, 1) if re.match(r"\s*#\s*define\s+\w+\s+\S", c)]
+    consts = [s for s in statements if re.match(r"(static\s+)?const\b", re.sub(r"\s+", " ", s[1]))]
+    if not functions and not has_type and (defines or consts) and len(consts) == len(statements):
+        name = path.rsplit("/", 1)[-1]
+        users = [u for u in src.includers(name) if u != path]
+        if len(users) <= 1:
+            first = min(defines + [s[0] for s in consts])
+            return [Finding("constants-header", path, first, lines[first - 1],
+                            f"included from {len(users)} file(s)" + (f": {users[0]}" if users else ""))]
+    return []
+
+
+def string_findings(src: "Source", added: dict) -> list:
+    """string-define / repeated-string for the string literals the change adds in code (not in #defines,
+    #includes, pragmas or comments)."""
+    out, seen = [], {}
+    for path, rows in sorted(added.items()):
+        if not rows:
+            continue
+        lines = src.show(path).splitlines()
+        code = strip_code(lines)
+        for i in sorted(rows):
+            if i > len(code) or re.match(r"\s*#", code[i - 1]) or "static_assert" in code[i - 1]:
+                continue
+            for m in re.finditer(r'"\s*"', code[i - 1]):  # a literal: quotes kept, contents blanked
+                lit = lines[i - 1][m.start():m.end()]
+                if len(lit) < 6 or "\\" in lit or (len(seen) >= 40 and lit not in seen):
+                    continue  # short, escaped or too many to look up
+                if lit not in seen:
+                    seen[lit] = src.literal_uses(lit)
+                count, defines = seen[lit]
+                if defines:
+                    out.append(Finding("string-define", path, i, lines[i - 1], f"use {defines[0]} ({lit})"))
+                elif count >= 3:
+                    out.append(Finding("repeated-string", path, i, lines[i - 1], f"{lit} is in {count} places"))
+    return out
 
 
 def summary(findings) -> dict:

@@ -34,13 +34,24 @@ class GuardTests(unittest.TestCase):
         self.g = P.GhGuard(FORK, UP, "ai-sandbox/")
         self.harness = {(UP, 7): True, (FORK, 3): True, (UP, 99): False, (FORK, 98): False}
         self.is_h = lambda repo, n: self.harness.get((repo, n), False)
+        self.open = {(UP, 7): True, (FORK, 3): True}
+        self.is_o = lambda repo, n: self.open.get((repo, n), False)
 
     def ok(self, args, kind):
-        self.assertEqual(self.g.check(args, self.is_h), kind, args)
+        self.assertEqual(self.g.check(args, self.is_h, self.is_o), kind, args)
 
     def refused(self, args):
         with self.assertRaises(P.Refused, msg=" ".join(args)):
-            self.g.check(args, self.is_h)
+            self.g.check(args, self.is_h, self.is_o)
+
+    def test_refused_on_merged_or_closed_harness_prs(self):
+        # bwrsandman, #452: "Why are you spamming already merged PR's?"
+        self.harness[(UP, 8)] = True  # a harness PR, but merged
+        self.refused(["pr", "comment", "8", "--repo", UP, "--body-file", "f"])
+        self.refused(["pr", "review", "8", "--repo", UP, "--comment", "--body-file", "f"])
+        self.ok(["api", f"repos/{UP}/issues/8/comments"], "openblack")  # reading it is fine
+        with self.assertRaises(P.Refused):  # no state callback: comments are refused
+            self.g.check(["pr", "comment", "7", "--repo", UP, "--body-file", "f"], self.is_h)
 
     def test_allowed(self):
         self.ok(["pr", "list", "--repo", UP, "--author", "@me"], "openblack")
@@ -139,7 +150,12 @@ class RepoTests(unittest.TestCase):
                 {"number": 99, "headRefName": "someone-elses-feature", "headRepositoryOwner": {"login": "raffclar"},
                  "headRefOid": "c" * 40, "url": "u99", "title": "t"}],
             f"pr list --repo {FORK}": [],
-            f"pr view 7 --repo {UP}": {"headRefName": "ai-sandbox/20261010-good-abc1234", "headRepositoryOwner": {"login": "raffclar"}},
+            f"pr view 7 --repo {UP}": {"headRefName": "ai-sandbox/20261010-good-abc1234", "headRepositoryOwner": {"login": "raffclar"},
+                                       "state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+            f"pr view 8 --repo {UP}": {"headRefName": "ai-sandbox/20261009-old-def5678", "headRepositoryOwner": {"login": "raffclar"},
+                                       "state": "MERGED", "mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"},
+            f"pr view 9 --repo {UP}": {"headRefName": "ai-sandbox/20261011-late-aaa1111", "headRepositoryOwner": {"login": "raffclar"},
+                                       "state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND"},
             f"pr view 99 --repo {UP}": {"headRefName": "someone-elses-feature", "headRepositoryOwner": {"login": "raffclar"}},
             f"api repos/{UP}/issues/7/comments": [{"id": 11, "user": {"login": "bwrsandman"}, "body": "Please rename x.", "created_at": "t", "html_url": "h"}],
             f"api repos/{UP}/pulls/7/comments": [{"id": 12, "user": {"login": "raffclar"}, "body": "Line note", "path": "src/a.cpp", "line": 1}],
@@ -449,6 +465,62 @@ class RepoTests(unittest.TestCase):
         with self.assertRaises(P.Refused):
             pub.cmd_reply("openblack", 99, str(body), review=False)
         self.assertEqual(len([c for c in self.gh_calls() if c["args"][:2] == ["pr", "comment"]]), 1)
+
+    def posts(self):
+        return len([c for c in self.gh_calls() if c["args"][:2] in (["pr", "comment"], ["pr", "review"])])
+
+    def test_reply_never_on_merged_prs_and_no_spam(self):
+        # bwrsandman, #452: "Why are you spamming already merged PR's?"; #411/#468: "Needs rebase"
+        body = self.t / "body.md"
+        body.write_text("@bwrsandman addressed the review feedback. Ready for re-review when you have a moment.")
+        pub = P.Publisher(self.cfg(), dry_run=False)
+        pub.guards()
+        with self.assertRaises(P.Refused) as e:
+            pub.cmd_reply("openblack", 8, str(body), review=False)  # merged
+        self.assertIn("merged or closed", str(e.exception))
+        with self.assertRaises(P.Refused) as e:
+            pub.cmd_reply("openblack", 9, str(body), review=False)  # open, but behind main
+        self.assertIn("rebase", str(e.exception))
+        self.assertEqual(self.posts(), 0)
+        pub.cmd_reply("openblack", 7, str(body), review=False)  # open and clean: once
+        self.assertEqual(self.posts(), 1)
+        with self.assertRaises(P.Refused) as e:  # the same text again
+            pub.cmd_reply("openblack", 7, str(body), review=True)
+        self.assertIn("already posted", str(e.exception))
+        other = self.t / "other.md"
+        other.write_text("A different note.")
+        with self.assertRaises(P.Refused) as e:  # nobody answered our last post (bwr's comment fixture is older)
+            pub.cmd_reply("openblack", 7, str(other), review=False)
+        self.assertIn("nobody has answered", str(e.exception))
+        self.fixture[f"api repos/{UP}/issues/7/comments"].append(
+            {"id": 14, "user": {"login": "bwrsandman"}, "body": "Thanks", "created_at": "2999-01-01T00:00:00Z"})
+        (self.t / "fixture.json").write_text(json.dumps(self.fixture))
+        pub.cmd_reply("openblack", 7, str(other), review=False)  # he answered: one more is fine
+        self.assertEqual(self.posts(), 2)
+        third = self.t / "third.md"
+        third.write_text("Third.")
+        self.fixture[f"api repos/{UP}/issues/7/comments"][-1]["created_at"] = "3999-01-01T00:00:00Z"
+        (self.t / "fixture.json").write_text(json.dumps(self.fixture))
+        pub2 = P.Publisher(self.cfg(MAX_REPLIES_PER_DAY="2"), dry_run=False)
+        pub2.guards()
+        with self.assertRaises(P.Refused) as e:  # the daily cap
+            pub2.cmd_reply("openblack", 7, str(third), review=False)
+        self.assertIn("limit", str(e.exception))
+        self.assertEqual(self.posts(), 2)
+
+    def test_a_branch_that_conflicts_with_main_is_not_published(self):
+        # bwrsandman, #411/#468: "Needs rebase"
+        head = self.add_worker("stale", {"src/a.cpp": "int a = 7;\n"})
+        u = self.t / "U"
+        (u / "src/a.cpp").write_text("int a = 8;\n")
+        git("-C", str(u), "commit", "-qam", "upstream moved")
+        git("-C", str(self.t / "P.git"), "fetch", "-q", str(u), "+refs/heads/main:refs/remotes/origin/main")
+        pub = P.Publisher(self.cfg(QUALITY_GATE="false"), dry_run=True)
+        pub.guards()
+        pub.cmd_publish()
+        log = (self.t / "pub.log").read_text()
+        self.assertIn("REFUSED stale: needs rebase", log)
+        self.assertNotIn(f"-stale-{head[:7]}", log)
 
 
 if __name__ == "__main__":

@@ -59,8 +59,14 @@ class GateTests(unittest.TestCase):
         self.write({"configure.py": 'cflags = ["/DNDEBUG", "/D_LH_3D_LIB_"]\nmp = [*cflags, "/D_LH_MULTIPLAYER_LIB_"]\n'})
         self.base = self.commit()
         for macro in ("_LH_3D_LIB_", "_LH_MULTIPLAYER_LIB_"):
-            h = BASE_H.replace("struct Thing {", f"#ifdef {macro}\nstatic int g;\n#endif\nstruct Thing {{")
-            self.assertEqual(self.rules({"src/Thing.h": h}), [], macro)
+            # a module guard is not a header-toggle, but a reviewer sees it (warning) ...
+            h = BASE_H.replace("struct Thing {", f"#ifdef {macro}\nvoid LibOnly();\n#endif\nstruct Thing {{")
+            self.assertEqual(self.rules({"src/Thing.h": h}), [("module-guard", "warn")], macro)
+            # ... and statics under it are hard (bwr on #431: "Likely that this Static lives in the cpp file")
+            h = BASE_H.replace("struct Thing { void Real(); };",
+                               f"struct Thing\n{{\n\tvoid Real();\n#ifdef {macro}\n\tstatic int g_valid[8];\n#endif\n}};")
+            self.assertEqual(self.rules({"src/Thing.h": h}), [("guarded-static", "hard"), ("module-guard", "warn")],
+                             macro)
         # a per-header macro stays hard, and so does defining the module guard in a source file
         h = BASE_H.replace("struct Thing {", "#ifdef LAND_CELL_DARKNESS_COLOURS\nstatic int g;\n#endif\nstruct Thing {")
         self.assertIn(("header-toggle", "hard"), self.rules({"src/Thing.h": h}))
@@ -207,6 +213,107 @@ class GateTests(unittest.TestCase):
         self.write({"src/Thing.cpp": self.body("\tint a = 3;\n")})
         git(self.t, "add", "-A")
         self.assertEqual(Q.main(["--repo", str(self.t), "--staged"]), 0)
+
+    # --- bwrsandman's review of #431 and his comments on #411/#412 (2026-10-12) ---------------------------
+
+    def test_single_line_anonymous_enum(self):
+        # #412 GestureSample.h: "I prefer a list of defines than an anonymous enum for named values"
+        got = self.rules({"src/Thing.h": BASE_H.replace("struct", "enum { MAX_SAMPLES = 0x50, DIRECTIONS = 8 };\nstruct")})
+        self.assertEqual(got, [("anon-enum", "hard")])
+        self.fresh()  # a named enum and a typedef'd one are types, not lists of constants
+        got = self.rules({"src/Thing.h": BASE_H.replace("struct", "enum THING_KIND { THING_KIND_A };\n"
+                                                                   "typedef enum { X_A } X;\nstruct")})
+        self.assertEqual(got, [])
+
+    def test_array_size(self):
+        # #431 CitadelHeartInfo.h: "We have an ARRAY_SIZE macro to do this"
+        for expr in ("sizeof(Infos) / sizeof(Infos[0])", "sizeof Infos / sizeof *Infos", "sizeof(t.a)/sizeof(t.a[0])"):
+            self.fresh()
+            got = self.rules({"src/Thing.cpp": self.body(f"\tint n = {expr};\n")})
+            self.assertEqual(got, [("array-size", "hard")], expr)
+        self.fresh()
+        self.assertEqual(self.rules({"src/Thing.cpp": self.body("\tint n = sizeof(a) / sizeof(b[0]);\n")}), [])
+        self.fresh()  # the macro's own definition is fine
+        self.assertEqual(self.rules({"include/re_common.h": "#define ARRAY_SIZE(array) (sizeof(array) / "
+                                                            "sizeof((array)[0]))\n"}), [])
+
+    def test_dup_helper(self):
+        # #431 GJUtils.h boundf: "We have a macro for this already"
+        boundf = "inline float boundf(float value, float low, float high)\n{\n\treturn value > low ? min(value, high) : low;\n}\n"
+        got = self.rules({"src/GJUtils.h": boundf})
+        self.assertEqual(got, [("dup-helper", "hard")])
+        for text in ("inline int Clamp(int v)\n{\n\treturn v;\n}\n", "#define COUNTOF(a) (sizeof(a) / 4)\n",
+                     "inline float Pick(float a, float b)\n{\n\treturn a > 0 ? max(a, b) : b;\n}\n"):
+            self.fresh()
+            self.assertIn(("dup-helper", "hard"), self.rules({"src/Util.h": text}), text)
+        self.fresh()  # a real symbol is exempt, and ordinary names are not helpers
+        self.write({"config/BW1W120/symbols.txt": SYMBOLS + "?clampf@@YAMM@Z = .text:0x00402000; // type:function\n"})
+        self.base = self.commit()
+        self.assertEqual(self.rules({"src/Util.h": "inline float clampf(float v)\n{\n\treturn v;\n}\n"
+                                                   "inline float GetMaxSpeed(float v)\n{\n\treturn v;\n}\n"}), [])
+
+    def test_own_header(self):
+        # #431 CameraInline.h: "This doesn't need its own header"
+        h = ('#ifndef BW1_DECOMP_CAMERA_INLINE_INCLUDED_H\n#define BW1_DECOMP_CAMERA_INLINE_INCLUDED_H\n\n'
+             '#include "Camera.h" /* For GCamera */\n\ninline void GCamera::GetPosition(LHPoint& pos)\n{\n'
+             '\tpos = LH3DTech::g_camera.pos;\n}\n\n#endif\n')
+        self.assertEqual(self.rules({"src/CameraInline.h": h}), [("own-header", "hard")])
+        self.fresh()  # adding the inline to an existing header, or a new header declaring its class, is fine
+        self.assertEqual(self.rules({"src/Thing.h": BASE_H.replace("#endif", "inline void Thing::Real()\n{\n}\n#endif")}),
+                         [])
+        self.fresh()
+        self.assertEqual(self.rules({"src/New.h": "struct New\n{\n\tvoid F();\n};\ninline void New::F()\n{\n}\n"}), [])
+
+    def test_constants_header_included_from_one_file(self):
+        # #412 GestureConstants.h: "How many places is this included from?"
+        h = "#ifndef G_H\n#define G_H\nconst float GESTURE_SECTOR_ANGLE = 0.3926991f;\n#define GESTURE_COUNT 8\n#endif\n"
+        one = '#include "GestureConstants.h"\n' + self.body("")
+        got = self.rules({"src/GestureConstants.h": h, "src/Thing.cpp": one})
+        self.assertEqual(got, [("constants-header", "warn")])
+        self.fresh()
+        got = self.rules({"src/GestureConstants.h": h, "src/Thing.cpp": one,
+                          "src/Other.cpp": '#include <Black/GestureConstants.h>\n',
+                          "src/Third.h": '#include "GestureConstants.h"\n'})
+        self.assertEqual(got, [])
+
+    def test_guarded_static_in_a_library_header(self):
+        # #431 InfluenceCircle.h / LH3DIsland.h: statics under #ifdef _LH_3D_LIB_ in the class
+        h = BASE_H.replace("struct Thing { void Real(); };",
+                           "class InfluenceCircle\n{\npublic:\n#ifdef _LH_3D_LIB_\n"
+                           "\t// BW1W120 00eb9a1c BW1M119 011cea38 (LHCombined Release)\n"
+                           "\tstatic bool32_t g_b_valid[INFLUENCE_CIRCLE_PLAYER_COUNT];\n#endif\n"
+                           "\tstatic void Draw();\n};")
+        got = self.rules({"src/Thing.h": h})
+        self.assertIn(("guarded-static", "hard"), got)
+        self.assertEqual(len([f for f in Q.run(str(self.t), self.base, "HEAD") if f.rule == "guarded-static"]), 1)
+
+    def test_string_literals_use_the_existing_define(self):
+        # #431 PSysBase.h: "This is a very commonly used string can you put it in a define?"
+        self.write({"src/PSysBase.h": '#define PSYS_DEBUG_TEXT "##a_class:"\n'})
+        self.base = self.commit()
+        got = self.rules({"src/PSys.h": 'struct P\n{\n\tchar* GetDebugText() { return "##a_class:"; }\n};\n'})
+        self.assertEqual(got, [("string-define", "hard")])
+        f = [f for f in Q.run(str(self.t), self.base, "HEAD") if f.rule == "string-define"][0]
+        self.assertIn("PSYS_DEBUG_TEXT", f.detail)
+
+    def test_repeated_string_is_a_warning(self):
+        self.write({"src/A.cpp": 'const char* a = "##b_class:";\n', "src/B.cpp": 'const char* b = "##b_class:";\n'})
+        self.base = self.commit()
+        got = self.rules({"src/C.h": 'struct P\n{\n\tchar* T() { return "##b_class:"; }\n};\n'})
+        self.assertEqual(got, [("repeated-string", "warn")])
+        self.fresh()  # once or twice is fine, and static_assert messages are not counted
+        self.write({"src/A.cpp": 'const char* a = "##b_class:";\n'})
+        self.base = self.commit()
+        self.assertEqual(self.rules({"src/C.h": 'struct P\n{\n\tchar* T() { return "##b_class:"; }\n};\n'}), [])
+
+    def test_deviation_markers(self):
+        # #411: "It's too early to deviate from original code" (report the bug as an issue instead)
+        for text in ("#ifdef BUGFIX\n\tx = 1;\n#endif\n", "\t// BUGFIX: the original reads past the end\n",
+                     "#if FIX_BUGS\n\tx = 1;\n#endif\n", "\t// fixes an original bug in the sample count\n"):
+            self.fresh()
+            self.assertIn(("deviation", "hard"), self.rules({"src/Thing.cpp": self.body(text)}), text)
+        self.fresh()  # describing the original's bug while reproducing it is fine
+        self.assertEqual(self.rules({"src/Thing.cpp": self.body("\t// Original bug: reads one past the end\n")}), [])
 
 
 if __name__ == "__main__":

@@ -19,6 +19,22 @@ An Attending (a separate reviewer who does not see this conversation) reviews yo
 - Case start (the commit the case begins from): `{{START}}`
 - Work on your current branch. Do not rebase, reset or merge.
 
+## Judgement rules (bwrsandman, the maintainer, 2026-10-12; the gate cannot check these)
+
+- Placement needs evidence. Each new function, macro, constant or static goes where the evidence (Mac symbol, owning
+  class, library, the one TU that uses it) says the original had it, and the plan says what that evidence is. "Any
+  proof this should be in Gilles Jeremy's utils?" / "Wrong place for this". No new header for one or two inlines
+  ("This doesn't need its own header"), and statics that only one library TU needs live in that .cpp ("Likely that
+  this Static lives in the cpp file"), even if that costs a match: leave a TODO, never an implausible layout.
+- Types need evidence: "Do we know that load and save return bool32_t? ... most of them are marked as uint32_t".
+  Change a type only on Mac-symbol or asm evidence, and name it in the plan.
+- Minimise include spread: "How many places is this included from?" Constants for one file stay in that file.
+- Reuse existing macros (ARRAY_SIZE, CLAMP, min/max, existing string #defines such as PSYS_DEBUG_TEXT): "We have a
+  macro for this already". Search include/ and src/ before writing a helper.
+- No deviations from the original code: "It's too early to deviate from original code". Reproduce bugs, describe
+  them in a plain comment and list them under Open questions / in your summary for a GitHub issue.
+- No tests, tools or tooling nobody asked for ("Not sure I want this test"). Never touch a pull request yourself.
+
 ## What to do
 
 1. Reproduce the current state: build the case's objects, run `python3 tools/decomp-diff.py` on them, and run the
