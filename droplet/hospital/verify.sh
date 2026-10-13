@@ -5,7 +5,8 @@
 # Mounts: /work (rw) holds tree/ (the base tree, prepared on the host from git objects), head/ (the head tree) and,
 # when the case's start must be measured, start/ (the start tree); head/ and start/ have tools/ and configure.py
 # overlaid from the base, so the case can't change how it is verified. The shared toolchain is mounted read-only at
-# /work/tree/build/{tools,compilers}, the game data read-only at /opt/orig.
+# /work/tree/build/{tools,compilers}, the game data read-only at /work/tree/orig
+# (a real mount, not a symlink, so the project's orig/<VERSION>/../../build paths stay in the tree).
 # Env: WORKER_SETUP (the worker setup from sandbox.droplet.toml, a JSON argv list), VERSION (e.g. BW1W120).
 #
 # Steps: setup + `ninja baseline` at the base (-> /work/base-report.json); if /work/start exists, the start tree:

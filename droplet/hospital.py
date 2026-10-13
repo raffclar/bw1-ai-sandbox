@@ -330,11 +330,14 @@ class PristineVerifier:
                 self.extract(self.repo, base, workdir / sub, overlay)
         for sub in ("build/tools", "build/compilers"):
             (workdir / "tree" / sub).mkdir(parents=True, exist_ok=True)
-        try:
-            (workdir / "tree" / "orig").unlink(missing_ok=True)
-            (workdir / "tree" / "orig").symlink_to("/opt/orig")
-        except OSError:
-            pass  # no symlinks here (tests on Windows); the container has its own check
+        # orig is a real directory, the mount point of the game data (container_args). Not a symlink to /opt/orig:
+        # the project reaches the preprocessed exe as orig/<VERSION>/../../build/..., and the OS resolves `..` after
+        # following a symlink, so through /opt/orig that climb leaves the tree (/opt/build) and every linker-provided
+        # unit fails (openblack main 5db768f3's tools: linker_unit.py --original).
+        orig = workdir / "tree" / "orig"
+        if orig.is_symlink() or orig.is_file():
+            orig.unlink()
+        orig.mkdir(exist_ok=True)
 
     def container_args(self, workdir: Path) -> dict:
         uid = os.getuid() if hasattr(os, "getuid") else 2000
@@ -351,7 +354,7 @@ class PristineVerifier:
                      str(PROMPTS / "verify.sh"): {"bind": "/verify/verify.sh", "mode": "ro"},
                      f"{self.shared_tree}/build/tools": {"bind": "/work/tree/build/tools", "mode": "ro"},
                      f"{self.shared_tree}/build/compilers": {"bind": "/work/tree/build/compilers", "mode": "ro"},
-                     self.shared_data: {"bind": "/opt/orig", "mode": "ro"}},
+                     self.shared_data: {"bind": "/work/tree/orig", "mode": "ro"}},
         )
 
     def __call__(self, base: str, head: str, workdir: Path, start: str = ""):

@@ -572,7 +572,12 @@ class HospitalTests(unittest.TestCase):
         self.assertEqual(args["cap_drop"], ["ALL"])
         self.assertTrue(args["read_only"])
         ro = {v_["bind"] for k, v_ in args["volumes"].items() if v_["mode"] == "ro"}
-        self.assertEqual(ro, {"/verify/verify.sh", "/work/tree/build/tools", "/work/tree/build/compilers", "/opt/orig"})
+        self.assertEqual(ro, {"/verify/verify.sh", "/work/tree/build/tools", "/work/tree/build/compilers",
+                              "/work/tree/orig"})
+        # orig is the game data's mount point, a real directory: through a symlink to /opt/orig the project's
+        # orig/<VERSION>/../../build paths would resolve outside the tree
+        self.assertTrue((work / "tree/orig").is_dir())
+        self.assertFalse((work / "tree/orig").is_symlink())
         self.assertEqual(json.loads(args["environment"]["WORKER_SETUP"]), ["python3", "-c", "pass"])
 
     def test_pristine_verifier_runs_the_container_and_reads_its_result(self):
