@@ -913,6 +913,19 @@ class HospitalTests(unittest.TestCase):
         self.assertEqual((work / "start/tools/decomp-diff.py").read_text(), "print('base tool')\n")
         v.prepare(self.base, self.start, work)
         self.assertFalse((work / "start").exists())
+        # a merge case's start predates the base (upstream main moved on): the base's configure.py lists sources
+        # the start doesn't have, so the start keeps its own tools and configure.py; the head still gets the base's
+        git(self.repo, "checkout", "-q", "-b", "upstream", self.base)
+        self.write({"tools/decomp-diff.py": "print('newer tool')\n", "configure.py": "print('newer configure')\n",
+                    "src/New.cpp": "int fresh;\n"})
+        newer = self.commit_all("upstream: a new source")
+        git(self.repo, "checkout", "-q", "fellow")
+        v.prepare(newer, self.start, work, start=self.old)
+        self.assertEqual((work / "start/configure.py").read_text(), "print('base configure')\n")
+        self.assertEqual((work / "start/tools/decomp-diff.py").read_text(), "print('base tool')\n")
+        self.assertFalse((work / "start/src/New.cpp").exists())
+        self.assertEqual((work / "head/configure.py").read_text(), "print('newer configure')\n")
+        self.assertEqual((work / "head/tools/decomp-diff.py").read_text(), "print('newer tool')\n")
         sh = (DROPLET / "hospital/verify.sh").read_text()
         for want in ("/work/base-report.json", "/work/start-report.json", "/work/head-report.json",
                      "--fail-on-regression"):

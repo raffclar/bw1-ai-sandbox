@@ -312,7 +312,13 @@ class PristineVerifier:
 
     def prepare(self, base: str, head: str, workdir: Path, start: str = "") -> None:
         """workdir/tree = the base tree; workdir/head = the head tree, and workdir/start (only when start is given)
-        the start tree, both with tools/ and configure.py from the base. Old reports are removed."""
+        the start tree, both with tools/ and configure.py from the base. Old reports are removed.
+
+        A start that doesn't contain the base (a merge case: the start predates the upstream main it will merge)
+        keeps its own tools/ and configure.py: the base's list sources the start doesn't have yet (openblack main
+        5db768f3's GestureSystem*.cpp against PR #431's 7f26485d), so it could never build. The start is fixed at
+        triage, not the case's work, so this gives the case no say in how it is verified; the head still gets the
+        base's."""
         for sub in ("tree", "head", "start"):
             shutil.rmtree(workdir / sub, ignore_errors=True)
         for f in ("verify.json", "base-report.json", "head-report.json"):
@@ -324,6 +330,8 @@ class PristineVerifier:
             if not rev:
                 continue
             self.extract(self.repo, rev, workdir / sub)
+            if sub == "start" and not self.contains(rev, base):
+                continue
             shutil.rmtree(workdir / sub / "tools", ignore_errors=True)
             (workdir / sub / "configure.py").unlink(missing_ok=True)
             if overlay:
@@ -338,6 +346,10 @@ class PristineVerifier:
         if orig.is_symlink() or orig.is_file():
             orig.unlink()
         orig.mkdir(exist_ok=True)
+
+    def contains(self, rev: str, ancestor: str) -> bool:
+        return subprocess.run(["git", "-c", "safe.directory=*", "-C", str(self.repo), "merge-base", "--is-ancestor",
+                               ancestor, rev], capture_output=True).returncode == 0
 
     def container_args(self, workdir: Path) -> dict:
         uid = os.getuid() if hasattr(os, "getuid") else 2000
